@@ -1,0 +1,2014 @@
+---
+title: \vspace{3in} Analysing Travel Time Patterns in London
+header-includes:
+  - \usepackage{float}
+  - \usepackage{tabu} 
+subtitle: "CEGE0042: Spatial-temporal Data Analysis and Data Mining"
+author: "Ju Young Park, Junju Ng, Ng Jia Wen & Xulan Huang"
+output:
+  bookdown::pdf_document2:
+    fig_caption: yes
+    number_sections: yes
+    toc: False
+    toc_depth: 5
+    includes:
+      in_header: preamble-latex.tex
+bibliography: [library.bib]
+biblio-style: apalike
+always_allow_html: yes
+link-citations: yes
+---
+
+\pagebreak
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.pos = 'H', echo = FALSE,cache=TRUE, autodep=TRUE, cache.comments=FALSE,message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+               cache=TRUE, autodep=TRUE, cache.comments=FALSE,
+               message=FALSE, warning=FALSE)
+knitr::opts_chunk$set(fig.pos = 'H')
+
+#setwd("~/Documents/UCL/Term_2/STA/coursework/stdm")
+#setwd("~/Postgrad/Term 2/CEGE0042/stdm")
+setwd("C:/Users/ngjun/Desktop/Masters/stdmcw/stdm")
+```
+
+\tableofcontents
+
+```{r}
+
+library(rgdal)
+library(tmap) 
+library(dplyr)
+library(rgeos)
+library(RColorBrewer)
+library(leaflet)
+library(mapview)
+library(lattice) 
+library(purrr) 
+library(magick) 
+library(ggplot2)
+library(reshape2)
+library(fpp2)
+library(seasonal)
+library(tseries) # for tests
+source('starima_package.R')
+library(forecast)
+library(kableExtra)
+library(gridExtra)
+library(knitr)
+library(urca)
+library(sp)
+library(kernlab)
+library(maptools)
+library(caret)
+library(tseries)
+library(png)
+library(float)
+```
+
+```{r getdata, echo = FALSE, include=FALSE}
+
+load('UJTWorkSpace.RData')
+
+# get roads with data
+roads <- LCAPShp[LCAPShp$LCAP_ID %in% as.numeric(colnames(UJT)),]
+
+# get westminster shapefile
+london_boroughs <- readOGR('boundaries/London_Borough_Excluding_MHW.shp')
+wm <- subset(london_boroughs, london_boroughs$NAME == 'Westminster')
+
+# get roads in westminster
+wm_roads <- subset(roads, roads$BOROUGH == 'Westminster')
+
+# get data and adjmatrix for westminster roads only
+data <- cbind(dates, UJT[,as.numeric(colnames(UJT)) %in% wm_roads$LCAP_ID])
+Adjmatrix <- LCAPAdj[,as.numeric(colnames(LCAPAdj)) %in% wm_roads$LCAP_ID]
+Adjmatrix <- Adjmatrix[as.numeric(rownames(Adjmatrix)) %in% wm_roads$LCAP_ID,]
+Adjmatrix <- Adjmatrix/rowSums(Adjmatrix) # scale each row in adjacency matrix such that the sum of each row is 1
+Adjmatrix[is.na(Adjmatrix)] <- 0 # replace all NaN values in matrix with 0
+
+```
+
+```{r helperfunctions}
+
+# convert time in numbers to time in real-time
+convert_time <- function(time){
+  min <- time*5
+  hours <- floor(min / 60)
+  min_remaining <- round((min/60 - hours)*60)
+  if (min_remaining == 0){
+    min_remaining = '00'
+  }
+  if (min_remaining  == 5){
+    min_remaining = '05'
+  }
+  final_hours <- 6+hours
+  if (final_hours < 10){
+    final_hours <- paste('0',final_hours, sep ="")
+  }
+  return(paste(final_hours, min_remaining, sep =""))
+}
+
+# convert time in real-time to time in numbers
+convert_realtime <- function(realtime){
+  realtime <- as.character(realtime)
+  hours <- as.numeric(substr(realtime, 1, 2))
+  mins <- as.numeric(substr(realtime, 3, 4))
+  hours_diff <- hours-6
+  total_mins_diff <- hours_diff *60 + mins
+  time <- total_mins_diff / 5
+  return(time)
+}
+
+# convert travel time in s/m to km/h
+convert_traveltime <- function(traveltime){
+  traveltime_hours <- traveltime / 60 / 60
+  print(traveltime_hours)
+  distance_km <- (1/1000)/traveltime_hours
+  print(distance_km)
+  return (distance_km)
+}
+
+```
+
+\pagebreak
+
+# Introduction
+
+Understanding and predicting urban traffic flows is vital, especially in London, a global financial hub that is home to many international headquarters (HQs). 33% of European HQs of Global Fortune 500 are in London and over 40% of the world's foreign equities are traded in London [@londonglobalcity]. London is also a transport hub to many other countries and cities, with its airport terminals seeing more than 100,000 flights per month [@londonglobalcity]. As such, it is of utmost importance for London to maintain its infrastructure and ensure the highest of standards. 
+
+The strains and stresses of being a global city has made London the second most congested city in Europe [@londoncongested], behind Moscow, and the sixth most gridlocked city in the world [@londonjam], with commuters spending an average of 227 hours a year stuck in traffic [@londonhours]. According to Inrix's 2018 Global Traffic Scorecard, traffic congestion has costed UK drivers 7.9 billion pounds, with London drivers losing up to £1,680 a year [@londonhours]. This highlights an urgency to improve urban traffic flows and one way to do so is to accurately predict and forecast travel times which can help aid the government's tranport policies and also inform road users of the estimated travel times. 
+
+As such, this project will be looking at forecasting travel time using data from Transport for London. In particular, the project will focus on the Westminster borough. 
+
+## Data Description 
+
+Travel time data collected using automatic number plate recognition technology on road networks in London in January 2011 was obtained from the UJTWorkspace provided. A study area, the Borough of Westminster, was selected for further analysis given its location in the heart of London. All 25 road segments in Westminster were included in the analysis. The study area and road segments studied are shown below.
+
+
+```{r roadmap, fig.cap="Plot of road segments in Westminster. The black polygon marks the boundaries of the Borough of Westminster while the blue lines represent the road segments that will be examined in this study.",echo=FALSE,message=FALSE}
+# map westminster and roads
+tmap_mode("view")
+tm_shape(wm) +
+  tm_fill(alpha = 0) +
+  tm_borders() +
+tm_shape(wm_roads)+
+  tm_lines(col = 'blue')
+```
+
+
+### Spatial Weight Matrix
+
+A first-order adjacency matrix is provided in the UJTWorkspace. Only road links in the study area, Westminster, were extracted from the adjacency matrix provided. The provided adjacency matrix was then modified such that the sum of each row is equal to 1 (or 0) for use in later analysis. The modified adjacency matrix shown below will used to represent spatial characteristics in the spatial-temporal approaches which will be implemented (e.g. STARIMA, and ST-SVR modelling approaches).
+
+
+```{r Adjmatrix, echo=FALSE, fig.cap="Modified adjacency matrix used in STARIMA model"}
+#View(Adjmatrix) # spatial weight matrix to be used
+Adjmatrix
+```
+
+
+\pagebreak 
+
+# Exploratory Analysis
+
+An exploratory analysis of the travel time data will be conducted in this section to better understand the characteristics of the data.
+
+
+```{r overallstats}
+data_matrix <- data.matrix(data[,3:ncol(data)])
+# overall average and st dev of travel time in wm
+mu <- mean(data_matrix) # 0.2330905 s/m
+sd <- sd(data_matrix) # 0.1373231
+
+```
+
+
+```{r exploratory, fig.cap="Histogram of car speeds in seconds per metre in Westminster."}
+# get histogram by frequency across road ids
+hist(data_matrix, main = 'Average Car Speed (s/m) in Westminster')
+abline(v=mu, col="red")
+```
+
+
+A histogram of travel times in Westminster is plotted in Figure \@ref(fig:exploratory). Total average travel time: `r round(mu,1)` sec/m which is `r round(convert_traveltime(mu),1)`km/h, with a standard deviation of `r round(convert_traveltime(sd),1)` across 30 days of data. This shows that there is a huge variation of travel speeds in westminster. The histogram reveals a right-skewed distrbution.
+
+
+\pagebreak
+
+
+```{r exploratoryday}
+# get df, matrix and ts objects
+data_by_day <- aggregate(data, by=list(data$Date), FUN=mean)[,-1][,-2]
+data_by_day <- cbind(
+  setNames(data.frame(weekdays(as.Date(data_by_day$Date,'%Y-%m-%d'))), c('Day')),
+  data_by_day)
+data_by_day$Day <- paste(seq_len(nrow(data_by_day)), data_by_day$Day)
+data_by_day_matrix <- data.matrix(data_by_day)[,3:ncol(data_by_day)]
+data_by_day_ts <- ts(data_by_day_matrix)
+
+# get df in long format
+data_by_day_long <- melt(data_by_day[,-2], id="Day")  # convert to long format
+data_by_day_long$Day <- factor(data_by_day_long$Day, levels = rev(unique(data_by_day_long$Day)), ordered=TRUE)
+
+# plot time series for across road segments through Jan
+plot_ts_roads <- ggplot(data_by_day_long, aes(Day, y=value, col=variable,
+                                                 group=variable)) + geom_line() +
+                    theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+                    xlab('Days in January') +
+                    ylab('Travel time (s/m)')+
+                    scale_x_discrete(limits = rev(levels(data_by_day_long$Day)))+
+                    labs(color = "Road Segments")
+
+
+# aggregate all road segments
+data_by_day_all <- data.frame(days = data_by_day$Day,
+                              values = rowMeans(data_by_day_ts))
+data_by_day_all$days<- factor(data_by_day_all$days, levels = data_by_day_all$days)
+
+
+# plot aggregated time series across days in Jan
+plot_ts_all <-ggplot(data=data_by_day_all, aes(x=days, y=values, group=1)) +
+                      geom_line()+
+                      geom_point()+
+                      theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+                      xlab('Days in January') +
+                      ylab('Travel time (s/m)')
+
+# get heatmap across days and road segments
+# -- scale it if false
+plot_hm_roads <-  function(std){
+  matrix <- data_by_day_matrix
+  if (!std){
+    matrix <- scale(matrix)
+  }
+  hm <- levelplot(
+    matrix,
+    aspect = "fill",
+    main="Travel Time in January (s/m)",
+    col.regions =
+      colorRampPalette(rev(brewer.pal(11,"RdYlGn"))),
+    scales=list(x=list(
+        labels=data_by_day$Day,
+        at=seq_len(nrow(data_by_day)),
+        rot=90)),
+        xlab = 'Days In January',
+        ylab = 'Road Segments by ID')
+  return(hm)
+}
+
+
+```
+
+
+
+```{r getspeedmap}
+
+# get speed map
+# -- for a specific time:
+# -- call get_speed_map('time', 1) or get_speed_map('time', convert_realtime('0600'))
+
+# -- for a specific day:
+# -- call get_speed_map('day', 1)
+
+get_speed_map <- function(day_or_time, value){
+
+  if (day_or_time == 'day'){
+    df <- data_by_day[,-c(1:2)][value,]
+  }
+  else if (day_or_time == 'time'){
+    df <- data_by_time[value,]
+  }
+
+  data_df <- data.frame(t(df))
+  roads <- wm_roads
+  roads@data <- merge(data_df,
+                             roads@data,
+                             by.x = 0,
+                             by.y = 'LCAP_ID',
+                             all=TRUE)
+
+  colnames(roads@data)[2] <- "values"
+
+  wm_transformed <- spTransform(wm, CRS("+proj=longlat +datum=WGS84"))
+
+  # colors and labels
+  pal <- colorNumeric(
+    palette = rev(brewer.pal(11,'RdYlGn')),
+    domain = wm_transformed$values)
+  roads_transformed <- spTransform(roads,
+                                          CRS("+proj=longlat +datum=WGS84"))
+  centers <-gCentroid(roads_transformed, byid = TRUE)
+  centers$road_id <- roads_transformed$Row.names
+
+  if (day_or_time == 'day'){
+      mylabel <- paste(value, 'January 2011')
+  }
+  else if (day_or_time == 'time'){
+      mylabel <- paste('At time:', convert_time(value))
+  }
+  # plot map
+  speedmap <- leaflet() %>%
+              setView(-0.142342, 51.511250, zoom = 13) %>%
+              addProviderTiles(providers$CartoDB.Positron) %>%
+              addPolylines(data = roads,
+                           color = ~pal(values),
+                           opacity = 0.7,
+                           weight = 2
+                           ) %>%
+              addLabelOnlyMarkers(data = centers,
+                                  label = ~road_id,
+                                  labelOptions = labelOptions(
+                                    noHide = TRUE,
+                                    direction = 'auto',
+                                    textOnly = TRUE)
+                                  ) %>%
+
+              addLabelOnlyMarkers(lng = -0.109148,
+                                  lat = 51.525908,
+                                  label = mylabel,
+                      labelOptions = labelOptions(noHide = T,
+                                                  textOnly = T,
+                                                  style =list(
+                                                    "color" = "black",
+                                                    "font-family" = "Helvetica",
+                                                    "font-style" = "bold",
+                                                    "font-size" = "20px",
+                                                    "border-color" ="rgba(0,0,0,0.5)"
+                                                    ))) %>%
+              addPolygons(data = wm_transformed,
+                          color = 'black',
+                          fillOpacity = 0,
+                          weight = 0.8)
+
+  return(speedmap)
+}
+
+
+```
+
+
+To understand more about the underlying travel time patterns, a time series plot across the 30 days in January is used:
+
+
+```{r show-plot-ts-roads, echo=FALSE, fig.cap="Average daily travel time in s/m across all road segments in Westminster."}
+plot_ts_roads
+```
+
+
+The line graph (Figure \@ref(fig:show-plot-ts-roads)) shows travel time in seconds per metres of `r ncol(data_by_day_matrix)` road segments in westminster in the month of January 2011. There seems to be 2 observable patterns:
+
+1. Spatio-relationship between travel time and road segment
+
+Magnitude of travel times is strongly correlated to the road segment they are on, where travel times for each road segment is almost always either consistently higher or lower than the ther road segments.
+
+2. Temporal-relationship between travel time and day of the week
+
+Peaks and dips in travel time seem to occur on the same day in all road segments. For example, there are obvious peaks in travel time on all road segments on 2nd January (Sunday) and 19th January (Wednesday).
+
+\pagebreak
+
+An aggregated time series plot may be able to show a clearer pattern in temporal variation across the days:
+
+
+```{r show-plot-ts-all, echo=FALSE, fig.cap="Average daily travel time in s/m across in Westminster."}
+plot_ts_all
+```
+
+
+From Figure \@ref(fig:show-plot-ts-all), it is observed that travel time generally drastically drops from Friday to the Saturday, before reaching an all-time low on Sundays, and increases almost in a linear fashion from Monday to Friday (although there seems to be a small sharp increase in the middle of the week). This aligns to our expectations as fewer cars are on the roads during the weekends as compared to the weekdays where people drive to work.
+
+
+The only outlier in the data is the travel time on 3rd January (Monday). This is likely due to it being a public holiday (in lieu of New Year's Day). Hence, travel time is expected to behave as if it was a weekend. This data point may have to be removed or be taken into account when building the forecasting model.
+
+\pagebreak
+
+A heatmap of travel time across days in January and road segments is produced (Figure \@ref(fig:show-plot-hm-roads)). The spatial relationship between travel time and road segment is clearly visible. Certain road segments like road segments 463, 2433, 2364, 1413 and 1593 experience consistent high travel times (denoted in yellow stripes).
+
+
+```{r show-plot-hm-roads, fig.cap="Heat map of average daily travel time in s/m across all road segments in Westminster."}
+plot_hm_roads(TRUE)
+```
+
+
+The location of road segments may explain their high travel times (Figure \@ref(fig:show-speed-map)). The Waterloo Bridge for instance, in a popular route for South Londoners who wish to travel across the river Thames to get to their workplace in the business district. Road segments in Central London near the St. James area are widely used and experience a heavy vehicle flow, as compared to road segments like road segment 897 that leads vehicles away from central london.
+
+
+```{r show-speed-map, fig.cap="Travel time map in Westminster on 10 January 2011."}
+get_speed_map('day', 10)
+```
+
+
+\pagebreak
+
+To better observed the temporal effects in travel time patterns, travel times across the road segments was standardised to exaggerate these effects. 5 vertical green blocks that represent low travel time during the weekends can be seen in the standardised heatmap (Figure \@ref(fig:show-hm-roads-std)). These findings support the earlier observations that travel times are spatially and temporally correlated.
+
+
+```{r show-hm-roads-std, echo=FALSE, fig.cap="Heat map of standardised average daily travel time in s/m across all road segments in Westminster."}
+plot_hm_roads(FALSE)
+```
+
+
+\pagebreak
+
+To further observe and break down any trends and seasonal patterns in the travel times, the averaged daily travel times were decomposed. Decomposing the daily travel times in January gives the following plots below (Figure \@ref(fig:decomtraveltime)). The strong seasonality pattern is further emphasised by the seasonality plot. There seems to be no clear trend however.
+
+
+```{r decomtraveltime, echo=FALSE, fig.cap="Decomposed plots of daily travel times in January. The topmost plot represents the orignal daily travel time averaged across all road segments in Westminster. The second plot shows the general trend in travel times, the third plot shows the seasonal pattern while the last plot shows the residuals of the decomposition."}
+df <- data_by_day_all
+decom <- stl(ts(df$values, frequency = 7), s.window = 'periodic')
+autoplot(decom, main = 'Decomposition of Daily Travel Times in January')
+```
+
+
+# Accounting for Outliers
+
+```{r cleanoutlier}
+# do a replacement for 3rd January data
+df[3,'values'] <-
+  mean(df[grep('Monday',df$days),]['values'][-1,])
+
+ts_df <- ts(df$values)
+
+```
+
+
+It was found that 3rd January 2011 was an outlier as it was a holiday. To ensure unbiased analysis, the average travel time on that day was replaced with the mean travel time of the remaining mondays in January. As such, the original value of `r data_by_day_all[3,'values']` s/m was replaced with the average travel time of the remaining mondays: `r ts_df[3]` s/m.
+
+\pagebreak
+
+# Overall Methodology
+
+There are 2 areas of interest we want to explore:
+
+
+1. Modelling parts vs Modelling whole
+
+2. Forecasting via statistical models vs Forecasting via machine learning
+
+
+The following subsections will explain what these mean.
+
+
+## Modelling Parts vs Modelling Whole
+
+Based on the earlier exploratory analysis, travel time is spatially and temporally correlated. Given that our task is to forecast the last 7 days of travel time, this means that we could model the aggregated daily travel time directly (without regard for its spatial relationships) or we could model the travel time for each road segment separately first then aggregate it. However, we hypothesise that modelling the travel time based on the aggregated data may be more accurate. Modelling individual road segments first may cause the model to overfit overall. This gives our first and second hypotheses:
+
+H1. Modelling aggregated daily travel time by ARIMA is more accurate than modelling travel time by road segments by STARIMA and then aggregating it
+
+H2. Modelling aggregated daily travel time by SVR is more accurate than modelling travel time by road segments by ST-SVR and then aggregating it
+
+## Forecasting via Statistical Models vs Forecasting via Machine Learning Models
+
+Several methods have been used for traffic flow predictions. These can be broadly classified into two main categories: statistical methods and machine learning methods. 
+
+1. Forecasting via Statistical Models
+
+Traditionally, statistical methods such as autoregressive integrated moving average (ARIMA) [e.g. @Kumar2015] and space-time autoregressive integrated moving average (STARIMA) models [e.g. @Kamarianakis2005] have been applied to model travel flows over time and space. These time-series models take into account the temporal sequence of a dataset. However, these methods usually require stationarity of the data.
+
+2. Forecasting via Machine Learning Models
+
+Machine learning methods such as support vector regression (SVR) [e.g. @Hong2011] have also been used for urban traffic flow forecasting. Machine learning methods can be used for time-series modelling but they usually assume that the variables are independent. However, time-series data would be required to be re-framed into a supervised learning format, in order to feed them as inputs into the machine learning models.
+
+
+Although both approaches have been successful, @Hong2011 argue that statistical methods like ARIMA, unlike machine learning methods like SVR, face difficulty in capturing rapid variational changes in traffic flow processes. However, given that there is only 30 days' worth of data, we hypothesise that the low dimensionality and volume of the dataset may make it difficult for machine learning models to generalise well. However, @Kumar2015 report that techniques such as ARIMA are also one of the most precise methods for forecasting traffic flows. As such, we will be employing ARIMA/STARIMA for the classical time-series modelling and SVR/ST-SVR for the machine learning model to examine which of the 2 methods would perform better with our 30 days worth of dataset.
+
+To this end, this gives us our third and fourth hypotheses:
+
+H3. Forecasting time-series with ARIMA gives better accuracy than with SVR
+
+H4. Forecasting time-series with STARIMA gives better accuracy than with ST-SVR
+
+
+# Experiments
+To test out both our hypotheses, we shall be using 4 modelling approaches:
+
+
+1. Model aggregated daily travel time with ARIMA (Jia Wen)
+
+2. Model daily travel time data on each of the road segments with STARIMA *then* aggregate the results (Junju)
+
+3. Model aggregated daily travel time with SVR (Ju Yong)
+
+4. Model daily travel time data on each of the road segments with ST-SVR *then* aggregate the results (Xulan)
+
+\pagebreak 
+
+## Model Aggregated Daily Travel Time with ARIMA
+
+ARIMA stands for auto-regressive integrated moving average, a set of statistical models that use past values of a time series to forecast future values of the series [@Haworth2018a]. It comprises of three components:
+
+1. AR: The autoregressive component
+
+
+$\hat{y_t}=c+ \phi{_1}y_{t-1}+\phi{_2}y_{t-2}+...+\phi{_p}y_{t-p}+\epsilon_t$
+
+2. I: The integration component
+
+This component refers to the differencing procedure where an order of 1 would mean differencing the series by lag 1. 
+
+3. MA: The moving average component
+
+This component uses past forecast errors to forecast future values of the series. A general MA model can be defined as:
+
+$\hat{y_t}=c+\epsilon_t+\theta{_1}\epsilon_{t-1}+\theta{_2}\epsilon_{t-2}+...+\theta{_q}\epsilon_{t-q}$
+
+An ARIMA model can be non-seasonal or seasonal in which case their notations will be as defined as follows: ARIMA(p,d,q) for non-seasonal and ARIMA(pdq)(PDQ)m for seasonal where p/P is the AR order, d/D is the order of differencing, q/Q is the MA order and m is the lag of the seasonal component.
+
+Data is aggregated to take the average of all travel time for all road segments for each day in January. 
+
+### Stationarity
+As ARIMA requires the time series to be stationary, we shall test for both trend and difference stationarity with Kwiatkowski-Phillips-Schmidt-Shin (KPSS) and Augmented Dickey-Fuller (ADF) test respectively. If both tests conclude that the series is stationary (non-stationary) then the series is stationary (non-stationary). If KPSS concludes stationary and the ADF concludes non-stationary then the series is trend stationary and the series can be detrended to make it stationary. If KPSS concludes non-stationary and ADF concludes stationary, then the series is difference stationary and the series can be differenced to make it stationary. 
+
+The null hypothesis of the KPSS test is that the data is trend stationary and since the test statistic of 0.2882 is smaller than the critical value at the 95% confidence interval -- 0.463, the null hypothesis is not rejected, so the series is trend-stationary (see Appendix section \@ref(test1)). 
+
+The null hypothesis of the ADF test is that the data is non-stationary (see below) and since the p-value is 0.2055 which is bigger than 0.05 at the 95% confidence interval, the null hypothesis is not rejected -- the series is non-stationary (see Appendix section \@ref(test2)). This indicates the presence of a unit root. 
+
+**The implication of these results is that there may be an underlying trend so the series needs to be detrended.**
+
+\pagebreak
+
+Plotting the ACF and PACF plots gives the following results:
+
+
+```{r acfpacf, fig.cap='Time series, ACF and PACF plots for travel time data'}
+ts_df %>% ggtsdisplay(lag.max=20)
+```
+
+
+The ACF plot shows significant lags at lags 1 and 7 (see Figure \@ref(fig:acfpacf)). A lag of 7 indicates a weekly seasonality, which is what we expect (travel time on mondays are likely to be similar to each other, same for tuesdays, wednesdays and so on). A lag of 1 implies that travel time today is correlated to travel time yesterday. (travel time on wednesday is more likely to be similar to travel time on tuesday than on monday).
+
+This means that we can attempt to stationarise the data by differencing at lag 1, lag 7 or both. This yields 4 possible scenarios:
+
+1.  No differencing (benchmark)
+2.  Do a non-seasonal difference with lag of 1
+3.  Do a seasonal difference with lag of 7
+4.  Do both differencing above 
+
+Results indicate that differencing at lag 1 does not help to stationarise data (see Appendix section \@ref(test3)).
+
+Results indicate that differencing at lag 7 stationarises the series as the null hypothesis of the KPSS test that the series is trend-stationary is not rejected and the null hypothesis of the ADF test that the series is not difference-stationary is rejected (see Appendix section \@ref(test4)).
+
+Results indicate that differencing at both lag 1 and 7 does not help to stationarise data (see Appendix section \@ref(test5)). 
+
+Following the analyses from above, we can make several hypothesis: 
+
+1. Models that have been differenced by lag 7 will perform better than models that have been differenced by lag 1.
+
+2. Models that have been differenced by lag 7 will perform better than models that have not been differenced. 
+
+3. Models that takes into account travel time of the previous day and seasonality, will offer the best predictions. 
+
+
+In the following section, we will build models for all scenarios to explore the validity of our hypotheses.
+
+### Finding optimal parameters
+
+Optimal paramters will be determined by looking at ACF and PACF plots. 
+
+1. No Differencing (benchmark)
+
+```{r nodiff, fig.cap='Time series, ACF and PACF plots of undifferenced time series'}
+ts_df %>% ggtsdisplay(lag.max=20)
+```
+
+The ACF graph (see Figure \@ref(fig:nodiff)) is described to have one or more spikes hence it is a MA model with order 2 (2 significant lags in ACF). This suggests a MA(2) model.
+
+\pagebreak
+
+2. Non-seasonal difference with lag of 1
+
+```{r diffone, fig.cap='Time series, ACF and PACF plots of time series differenced at lag 1'}
+ts_df %>% diff() %>% ggtsdisplay(lag.max=20)
+```
+
+The ACF graph (see Figure \@ref(fig:diffone)) is described to have one or more spikes hence it is a MA model with order 1 (1 significant lag in ACF). This suggests a MA(1) model with difference at lag 1.
+
+\pagebreak
+
+3.  Seasonal difference with lag of 7
+
+```{r diffseven, fig.cap='Time series, ACF and PACF plots of time series differenced at lag 7'}
+ts_df %>% diff(lag=7) %>%  ggtsdisplay(lag.max = 20)
+```
+
+The ACF graph (see Figure \@ref(fig:diffseven)) is described to have one or more spikes hence it is a MA seasonal model with order 1 (1 significant lag in ACF). This suggests a MA(1) model with difference at lag 7.
+
+\pagebreak
+
+4.  Do both differencing above 
+
+```{r diffboth, fig.cap='Time series, ACF and PACF plots of time series differenced at lag 1 and 7'}
+ts_df %>% diff(lag=7) %>% diff(lag=1) %>% ggtsdisplay(lag.max = 20)
+```
+
+Differencing with respect to the 1st and 7th lag yields a non-significant ACF and PACF plot (see Figure \@ref(fig:diffboth)) -- the data is now essentially random. Hence, this means that the data has been overdifferenced. 
+
+While the ACF plots suggest MA models to be used, it makes sense to consider autoregressive terms too, based on our initial hypothesis that the best model would account for both the effects of the previous day, and seasonality. Hence, we can also consider mixed AR and MA models, with p = 1. 
+
+This leads us to the following candidate models:
+
+A1) No Differencing (MA model): ARIMA(0,0,2)
+
+A2) No Differencing (mixed MA, AR model): ARIMA(1,0,2)
+
+B1) Non-seasonal difference with lag of 1 (MA model): ARIMA(0,1,1)
+
+B2) Non-seasonal difference with lag of 1(mixed MA, AR model): ARIMA(1,1,1)
+
+C1) Seasonal difference with lag of 7 (MA model): ARIMA(0,0,0)(0,1,1)7
+
+C2) Seasonal difference with lag of 7 (mixed MA, AR model): ARIMA(1,0,0)(0,1,1)7
+
+\pagebreak
+
+### Results
+
+Diagnostic checking was conducted for each of the 6 candidate models and results show that in all cases, the residuals were normally distributed and are uncorrelated (see Appendix section \@ref(diagcheck)). 
+
+```{r ARIMA(0,0,2)}
+set.seed(1)
+fit_1 <- Arima(ts_df[1:23],order=c(0,0,2),seasonal=list(order=c(0,0,0)))
+pre_1 <- predict(fit_1,n.ahead = 7)
+acc_1 <- accuracy(ts(pre_1$pred), ts_df[24:30])
+```
+
+```{r ARIMA(1,0,2)}
+set.seed(1)
+fit_1.2 <- Arima(ts_df[1:23],order=c(1,0,2),seasonal=list(order=c(0,0,0)))
+pre_1.2 <- predict(fit_1.2,n.ahead = 7)
+acc_1.2 <- accuracy(ts(pre_1.2$pred), ts_df[24:30])
+```
+
+```{r ARIMA(0,1,1)}
+set.seed(1)
+fit_2 <- Arima(ts_df[1:23],order=c(0,1,1),seasonal=list(order=c(0,0,0)))
+pre_2 <- predict(fit_2,n.ahead = 7)
+acc_2 <- accuracy(ts(pre_2$pred), ts_df[24:30])
+```
+
+```{r ARIMA(1,1,1)}
+set.seed(1)
+fit_2.2 <- Arima(ts_df[1:23],order=c(1,1,1),seasonal=list(order=c(0,0,0)),method="ML")
+pre_2.2 <- predict(fit_2.2,n.ahead = 7)
+acc_2.2 <- accuracy(ts(pre_2.2$pred), ts_df[24:30])
+```
+
+```{r ARIMA(0,0,0)(0,1,1)7}
+set.seed(1)
+fit_3 <- Arima(ts_df[1:23],order=c(0,0,0),seasonal=list(order=c(0,1,1),period=7))
+pre_3 <- predict(fit_3,n.ahead = 7)
+acc_3 <- accuracy(ts(pre_3$pred), ts_df[24:30])
+```
+
+```{r ARIMA(1,0,0)(0,1,1)7}
+set.seed(1)
+fit_3.2 <- Arima(ts_df[1:23],order=c(1,0,0),seasonal=list(order=c(0,1,1),period=7))
+pre_3.2 <- predict(fit_3.2,n.ahead = 7)
+acc_3.2 <- accuracy(ts(pre_3.2$pred), ts_df[24:30])
+```
+
+```{r}
+headers <- c('A1 ARIMA(0,0,2)','A2 ARIMA(1,0,2)','B1 ARIMA(0,1,1)','B2 ARIMA(1,1,1)', 'C1 ARIMA(0,0,0)(0,1,1)7','C2 ARIMA(1,0,0)(0,1,1)7')
+values <- data.frame(c(acc_1[1,2], acc_1.2[1,2], acc_2[1,2],acc_2.2[1,2], acc_3[1,2], acc_3.2[1,2]))
+rownames(values) <- headers
+colnames(values) <- 'RMSE'
+
+values$RMSE <- signif(values$RMSE,4)
+
+p <- ggplot(data=values, aes(y=RMSE, x=rownames(values), group=1)) +
+  geom_line()+
+  geom_point()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  xlab('ARIMA Candidate Models') +
+  ylab('RMSE') +
+  scale_x_discrete(limits = headers)  + #order
+  geom_label(label=values$RMSE, nudge_y = 0.005,nudge_x=0.002)
+```
+
+```{r arimamodels, fig.cap="RMSE scores of all 6 candidate ARIMA models"}
+p
+```
+
+Results indicate that the model C2: ARIMA(1,0,0)(0,1,1)7 yields the lowest Root Mean Squared Error (RMSE) (see Figure \@ref(fig:arimamodels)). This validates our third hypothesis: Models that takes into account travel time of the previous day and seasonality, offers the best predictions. 
+
+However, if we do not account for an autoregressive term (comparing models A1, B1 and C1), model A1: ARIMA(0,0,2) performs the best. This is surprising because we would expect model C1 to outperform model A1 as model C1 accounts for seasonality. Perhaps, with only 23 days worth of data to fit the model on, seasonality effects are not that significant. This denies our second hypothesis that models that have been differenced by lag 7 will perform better than models that have not been differenced. 
+
+Another interesting observation that we can see is that the RMSE drops significantly in models B1 to B2 and from C1 to C2. This however, is not observed from model A1 to A2. This means that the effects of including an autoregressive term in a model is more significant for a series that has been differenced than a series that has not been differenced. Perhaps, differencing a series helps to remove underlying seasonality and trends which helps the model to pick out autoregressive effects more easily.
+
+Lastly, we observe that models that have been differenced by lag 7 performed better in both cases, as compared to models that have been differenced by lag 1 (C1 > B1 & C2 > B2). This validates our first hypothesis that models that have been differenced by lag 7 will perform better than models that have been differenced by lag 1.
+
+Predicting the last 7 days in the month of January with the best model, model C2, produces the following graph below (see Figure \@ref(fig:bestmodel)):
+
+
+```{r bestmodel, fig.cap="Forecasted time series with model C2 against actual travel time"}
+
+plot_3.2 <- matplot(24:30, cbind(ts_df[24:30],pre_3.2$pred), 
+                  type="l", 
+                  xlab = 'Days in January', 
+                  ylab = 'Travel Time', 
+                  main = 'Forecasting Last 7 Days of Travel Time')
+legend('center', c('Forecasted','Actual'),col=c('red','black'),cex=0.8,fill=c('red','black'))
+
+```
+
+
+\pagebreak
+
+## Model daily travel time data on each of the road segments with STARIMA 
+Note: There seems to be a labelling error in the STARIMA package. Specifically, the ACF lags are labelled m+1, where m is the lag in question. For instance, lag 1 on the ACF graph is in reality lag 0. This is also evidenced by how the ACF at lag = 1 is 1.0. Thus, all lag labels on the ACF plots need to be subtracted by 1.
+
+### STARIMA
+A space-time autoregressive integrated moving average (STARIMA) model was implemented to forecast travel times for each individual road segment, taking into account first-order spatial characteristics. It presents each observation at time t and location i as a weighted combination of previous observations lagged across space and time [@Kamarianakis2005]. The first-order spatial topological relationships across space are represented by means of an N x N spatial weight matrix, where N is the number of road segments studied. 
+
+The daily travel time on each road segment is **then** aggregated to give a modelled aggregated daily travel time.
+
+Similar to the ARIMA model, the STARIMA model has three parameters: 1) autoregressive component, 2) integration component, 3) moving average component. These components are elaborated in the earlier section on ARIMA.
+
+For a STARIMA model with no seasonal component, the vector of observations at time t at N locations is represented using the equation:
+
+$Z_{t} = \sum_{k=1}^{p} \sum_{l=0}^{\lambda_{k}}\phi_{kl}W_{l}Z_{t-k} - \sum_{k=1}^{q}\sum_{l=0}^{m_{k}}\theta_{kl}W_{l}a_{t-k} + a_{t}$
+
+where $p$ is the autoregressive order, $q$ is the moving average order, $\lambda_{k}$ is the spatial order of the $k^{th}$ autoregressive term, $m_{k}$ is the spatial order of the $k^{th}$ moving average term, $\phi_{kl}$ and $\theta_{kl}$ are parameters to be estimated, $W_{l}$ is the $N \times N$ matrix for spatial order $l$, and $a_{t}$ is the random normally distributed disturbance vector at time $t$ [@Kamarianakis2005].
+
+For a STARIMA model with a seasonal component, this is represented using the equation:
+
+$\Phi_{P,\Lambda}(B^{S})\Phi_{p,\lambda}(B)\bigtriangledown^{D}_{S}\bigtriangledown^{d}Z_{t} = \Theta_{Q,M}(B^{S})\theta_{q,m}(B)a_{t}$
+
+where
+
+$\Phi_{P,\Lambda}(B^{S}) = I - \sum_{k=1}^{p}\sum_{l=0}^{\Lambda_{k}}\Phi_{kl}W_{l}B^{kS}$
+
+$\phi_{P,\lambda}(B) = I - \sum_{k=1}^{p}\sum_{l=0}^{\lambda_{k}}\phi_{kl}W_{l}B^{k}$
+
+$\Theta_{Q,M}(B^{S}) = I - \sum_{k=1}^{p} \sum_{l=0}^{\lambda_{k}} \Theta_{k,l}W_{l}B^{kS}$
+
+$\theta_{q,m}(B) = I - \sum_{k=1}^{q} \sum_{l=0}^{m_{k}} \theta_{kl} W_{l} B^{k}$
+
+where $\Phi_{kl}$ and $\phi_{kl}$ are the seasonal and nonseasonal autoregressive parameters at temporal lag $k$ and spatial lag $l$, $\Theta_{kl}$ and $\theta_{kl}$ are the seasonal and nonseasonal moving average parameters at lags $k$ and $l$, $P$ and $p$ are the seasonal and nonseasonal autoregressive orders, $Q$ and $q$ are the seasonal and nonseasonal moving average orders, $\Lambda_{k}$ and $\lambda_{k}$ are the seasonal and nonseasonal spatial orders for the $k^{th}$ autoregressive term, $M_{k}$ and $m_{k}$ are the seasonal and nonseasonal spatial orders for the moving average term. In addition, $D$ and $d$ are the number of seasonal and nonseasonal differences required, where $\bigtriangledown^{D}_{S}$ and $\bigtriangledown^{d}$ are the seasonal and nonseasonal difference operators, such that i.e., $\bigtriangledown^{D}_{S} = (I - B^{S})^{D}$ and $\bigtriangledown^{d} = (I-B)^{d}$ with seasonal lag $S$. Lastly, $a_{t}$ is the random normally distributed error vector at time $t$ [@Kamarianakis2005].
+
+
+```{r starima}
+ts_df_starima <- data_by_day_ts
+```
+
+\pagebreak
+
+### Space-time PACF and ACF Analysis
+Space-time PACF and ACF analysis is conducted to identify model parameters and determine if the series is stationary.
+
+
+#### Space-time ACF Analysis
+A space-time autocorrelation function plot was plotted to check for stationarity (Figure \@ref(fig:STACFnodiff)). As most lags are insignificant, the series is likely to be stationary. This is corroborated with the KPSS test (test-statistic = 0.1424 < 0.463 (critical value for 95% confidence interval)).  Thus, no additional differencing is needed to make the series stationary and a model based on the undifferenced series can be built.
+
+
+```{r STACFnodiff, echo=FALSE,message=FALSE,fig.cap="STACF plot of daily travel times across road segments in Westminster. The dashed lines approximate 95% confidence interval for the autocorrelation."}
+
+# Space-time autocorrelation to check for stationarity
+invisible(stacf(ts_df_starima, Adjmatrix, 22)) # use 22 lags as the number of max lags as using the first 23 days to predict the last 7 days
+# Has 3 spikes (lag 0, lag 1, and lag 7?), the rest are essentially zero. Thus, likely need to use an MA model (order indicted by where plot becomes zero). Also means that travel times are correlated with the day's travel times and those of the day of the week
+# As most lags are insignificant, series is likely to be stationary
+# Try using MA = 2 (i.e. q)
+
+# test for stationarity
+#ts_df_starima %>%  ur.kpss() %>%  summary() # test-statistic = 0.1424 < critical values for 95% confidence interval. Hence, stationary.
+# All tests indicate that the series is stationary, consistent with ACF plots
+```
+
+
+However, the undifferenced STACF plot depicts a spike at lag 8 (in reality lag 7), suggesting that travel times may be correlated with the day of the week. Thus, an additional model with weekly seasonal differencing will also be built. Consequently, an STACF plot with seasonal differencing at lag = 8 (Figure \@ref(fig:STACFdiffweekly)) is also plotted to estimate model parameters for the weekly differenced model. 
+
+The seasonally differenced STACF plot has only one significant lag at lag = 1, indicating that seasonal differencing can remove the potential weekly pattern. As the ACF plot only has a single spike, an MA(1) model is estimated. As most lags are insignificant, the series is likely stationary. This is corroborated with the KPSS test (test-statistic = 0.075 < 0.463 (critical value for 95% confidence interval)). Thus, no additional differencing is required.
+
+
+```{r STACFdiffweekly, echo=FALSE, fig.cap="STACF plot of daily travel times across road segments in Westminster after weekly seasonal differencing. The dashed lines approximate 95% confidence interval for the autocorrelation."}
+
+# Space-time autocorrelation to check for stationarity
+# try differencing using lag = 7
+ts_df_starima_diff7 <- diff(ts_df_starima, lag=8, differences=1)
+invisible(stacf(ts_df_starima_diff7, Adjmatrix, 21))
+
+# test for stationarity
+#ts_df_starima %>% diff(lag = 8) %>% diff(lag =1) %>%  ur.kpss() %>%  summary()
+# All tests indicate that the series is stationary, consistent with ACF plots
+```
+
+
+\pagebreak
+
+
+#### Space-time PACF analysis
+
+PACF plots are then plotted to determine the AR orders for undifferenced and weekly differenced travel time data for input into the STARIMA model. None of the lags of the undifferenced and differenced STPACF plots are significant (Figure \@ref(fig:STPACFnodiff) and \@ref(fig:STPACFdiffweekly)), thus the autoregressive order for the undifferenced and weekly differenced models is 0, giving rise to pure MA models.
+
+
+```{r STPACFnodiff, echo=FALSE, fig.cap="STPACF plot of daily averaged travel times in Westminster without differencing. The dashed lines approximate 95% confidence interval for the autocorrelation."}
+
+# look at PACF to determine AR. PACF is used to measure space-time autocorrelation at nonzero lags after accounting for the space-time autocorrelation at intervening lags
+invisible(stpacf(ts_df_starima, Adjmatrix, 22))
+#stpacf(ts_df_starima_diff1, Adjmatrix, 21)
+
+```
+
+
+```{r STPACFdiffweekly, echo=FALSE, fig.cap="STPACF plot of daily averaged travel times in Westminster after seasonal differencing weekly. The dashed lines approximate 95% confidence interval for the autocorrelation."}
+
+# look at PACF to determine AR. PACF is used to measure space-time autocorrelation at nonzero lags after accounting for the space-time autocorrelation at intervening lags
+
+# pacf for diff7
+invisible(stpacf(ts_df_starima_diff7, Adjmatrix, 18))
+```
+
+
+\pagebreak
+
+### Model Parameters
+
+Based on the ST-ACF and ST-PACF analyses, four main models are tested. The details of the models are given below.
+
+D1) No Differencing (MA model): STARIMA(0,0,2) -- in reality a STARIMA(0,0,1) model due to the labelling error
+
+*This model uses the forecast errors of previous day's travel time to forecast the next day's travel time.*
+
+D2) No Differencing (mixed MA, AR model): STARIMA(1,0,2) -- in reality a STARIMA(1,0,1) model due to the labelling error
+
+*This model uses the previous day's travel time and its forecast errors to forecast the next day's travel time.*
+
+E1) Seasonal differencing with lag of 7 (MA model): STARIMA(0,0,1)(0,1,1)8 -- in reality a STARIMA(0,0,1)(0,1,1)7 model due to the labelling error
+
+*The forecast errors of previous week's travel time on a given day of the week is used to forecast travel times on the same day of the following week.*
+
+E2) Seasonal differencing with lag of 7 (mixed MA, AR model): STARIMA(1,0,1)(0,1,1)8 -- in reality a STARIMA(1,0,1)(0,1,1)7 model due to the labelling error
+
+*The previous week's travel time on a given day of the week and its forecast errors is used to forecast travel times on the same day of the following week.*
+
+### Model Testing
+
+To create the model, travel time data for the first 23 days in January (i.e. 1 January to 23 January) was used to fit the model, and estimate model parameters. Thereafter, model parameters are used to predict travel times for the last 7 days in January (i.e. 24 January to 31 January). 
+
+```{r nodiffmodel,  echo=FALSE, fig.cap="STACF plot of residuals for undifferenced STARIMA model"}
+
+# no difference, no season
+#STARIMA(0,0,2)
+W_fit <- list(w1=Adjmatrix)
+#View(W_fit$w1)
+fit.star <- starima_fit(ts_df_starima[1:23,],W_fit,p=0,d=0,q=2)
+fit.star2 <- starima_fit(ts_df_starima[1:23,],W_fit,p=1,d=0,q=2)
+# View(fit.star$RES)
+# View(fit.star2$RES)
+
+# Check if residuals are random
+#stacf(fit.star$RES, Adjmatrix, 20) # ACF plot cuts off after one time lag hence residuals are random
+#stacf(fit.star2$RES, Adjmatrix, 19)
+
+pre.star <- starima_pre(ts_df_starima[22:30,],model=fit.star)
+pre.star2 <- starima_pre(ts_df_starima[21:30,],model=fit.star2)
+# View(pre.star$PRE)
+# View(pre.star2$PRE)
+
+# plot predictions for each road segment
+#i <- 10
+# for (i in 1:25){
+#   matplot(1:7, cbind(ts_df_starima[24:30,i],pre.star$PRE[,i]), type="l")
+#   print (i)
+# }
+
+# calculate NRMSE for each road segment
+#pre.star$NRMSE
+#pre.star2$NRMSE
+
+# aggregate all road segments to get mean travel time across all road segments on each day
+pre.star_all <- data.frame(values = rowMeans(pre.star$PRE))
+pre.star_all2 <- data.frame(values = rowMeans(pre.star2$PRE))
+
+# Calculate NRMSE for aggregated road segments
+nodiff_acc_res <- accuracy(ts(pre.star_all$values), ts_df[24:30])
+#nodiff_acc_res #0.1515708
+
+nodiff_acc_res2 <- accuracy(ts(pre.star_all2$values), ts_df[24:30])
+#nodiff_acc_res2 #0.02298834
+```
+
+```{r diffweeklymodel, echo=FALSE, fig.cap="STACF plot of residuals for weekly STARIMA model"}
+
+# difference lag 7, yes season
+#STARIMA(0,0,1)(0,1,1)7
+W_fit <- list(w1=Adjmatrix)
+#View(W_fit$w1)
+fit.starweek <- starima_fit(ts_df_starima[1:24,],W_fit,p=0,d=8,q=1)
+fit.starweek2 <- starima_fit(ts_df_starima[1:24,],W_fit,p=1,d=8,q=1)
+# View(fit.starweek$RES)
+# View(fit.starweek2$RES)
+
+# Check if residuals are random
+#stacf(fit.starweek$RES, Adjmatrix, 14) # ACF plot cuts off after one time lag hence residuals are random
+#stacf(fit.starweek2$RES, Adjmatrix, 13) # ACF plot cuts off after one time lag hence residuals are random
+
+pre.starweek <- starima_pre(ts_df_starima[15:30,],model=fit.starweek)
+pre.starweek2 <- starima_pre(ts_df_starima[14:30,],model=fit.starweek2)
+# View(pre.starweek$PRE)
+# View(pre.starweek2$PRE)
+
+# plot predictions for each road segment
+# i <- 10
+# for (i in 1:25){
+#   matplot(1:7, cbind(ts_df_starima[24:30,i],pre.starweek$PRE[,i]), type="l")
+#   print(i)
+# }
+
+# Calculate NRMSE for each road segment
+#pre.starweek$NRMSE
+#pre.starweek2$NRMSE
+
+# aggregate all road segments to get mean travel time across all road segments on each day
+pre.starweek_all <- data.frame(values = rowMeans(pre.starweek$PRE))
+pre.starweek_all2 <- data.frame(values = rowMeans(pre.starweek2$PRE))
+# View(pre.starweek_all)
+# View(pre.starweek_all2)
+
+# Calculate NRMSE for aggregated road segments
+weekly_acc_res <- accuracy(ts(pre.starweek_all$values), ts_df[24:30])
+#weekly_acc_res #0.01864941
+
+weekly_acc_res2 <- accuracy(ts(pre.starweek_all2$values), ts_df[24:30])
+#weekly_acc_res2 #0.01895957
+```
+
+STACF plots of the residuals of the fitted models were then plotted to determine if the residuals are random.
+
+
+```{r RESSTACF,  echo=FALSE, fig.cap="STACF plot for residuals of: D1 (top left), D2 (top right), E1 (bottom left), E2 (bottom right)"}
+par(mfrow=c(2,2))
+invisible(stacf(fit.star$RES, Adjmatrix, 20))
+invisible(stacf(fit.star2$RES, Adjmatrix, 19))
+invisible(stacf(fit.starweek$RES, Adjmatrix, 14))
+invisible(stacf(fit.starweek2$RES, Adjmatrix, 13))
+```
+
+
+As all of the STACF plots (Figure \@ref(fig:RESSTACF)) cut off after one time lag, the residuals of all these models are random. Thus, forecasting of the travel times for the last seven days using the various model parameters can be carried out.
+
+\pagebreak
+
+### Model Results
+
+This section presents results of the 4 different STARIMA models.
+
+#### NRMSE
+
+The NRSMEs for each road segment for each model is calculated and presented in Figure \@ref(fig:STARIMANRMSE). In general, NRMSEs are larger for the undifferenced models (e.g. D1 NRMSE ranges from 1.23-23.5, D2 NRMSE ranges from 0.822-1.97) compared to weekly differenced models (e.g. E1 NRMSE ranges from 0.756-13.8, E2 NRMSE ranges from 0.802-7.90). 
+
+
+```{r STARIMANRMSE,  echo=FALSE, fig.cap="NRMSEs of daily travel times for each road segment for all 4 STARIMA models"}
+par(mfrow=c(1,1))
+
+NRMSE_df <- data.frame(
+  Road_Segments = c('1883', '1884', '420', '423', '2468', '1576', '1593', '1613', '1616', '1460', '1412', '1413', '2112', '2364', '2363', '2173', '2318', '2433', '435', '524', '437', '469', '425', '463', '897'),
+  D1_NRMSE = c(pre.star$NRMSE),
+  D2_NRMSE = c(pre.star2$NRMSE),
+  E1_NRMSE = c(pre.starweek$NRMSE),
+  E2_NRMSE = c(pre.starweek2$NRMSE)
+)
+
+NRMSE_plot <- ggplot(NRMSE_df, aes(Road_Segments, group=1))+
+  geom_line((aes(y=D1_NRMSE, color="D1 NRMSE")))+
+  geom_line((aes(y=D2_NRMSE, color="D2 NRMSE")))+
+  geom_line((aes(y=E1_NRMSE, color="E1 NRMSE")))+
+  geom_line((aes(y=E2_NRMSE, color="E2 NRMSE")))+
+  scale_color_manual('Models',values=c("black", "red","blue","orange"))+
+  xlab('Road Segments') +
+  ylab('NRMSE')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+NRMSE_plot
+
+# kable(NRMSE_df)%>%
+#   kable_styling(full_width = T) %>%
+#   column_spec(1, bold = T, border_right = T) %>%
+#   column_spec(2)
+
+```
+
+
+Road segment 1460 has anomalously large NRMSEs (14.0, 1.86, 13.8, 7.90 for D1, D2, E1, E2 respectively). Further investigation suggests that the large error seen in the data for road segment 1460 is because travel times in the last week of January are anomalously shorter compared to the rest of the month (Figure \@ref(fig:rs1460)). As such, the STARIMA model is not accurate when the travel times deviate from the long-term trend. Although it was possible to exclude road segment 1460 from the prediction, a decision was made to include it in the model, for comparison with other approaches.
+
+
+```{r rs1460, echo=FALSE, fig.cap="Plot of travel times in January for road segment 1460"}
+
+data_by_day_rs1460 <- data.frame(days = data_by_day$Day,
+                              values = data_by_day_ts[,10])
+data_by_day_rs1460$days<- factor(data_by_day_rs1460$days, levels = data_by_day_rs1460$days)
+
+# plot aggregated time series across days in Jan
+plot_ts_rs1460 <-ggplot(data=data_by_day_rs1460, aes(x=days, y=values, group=1)) +
+                      geom_line()+
+                      geom_point()+
+                      theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+                      xlab('Days in January') + 
+                      ylab('Travel time s/m')
+
+plot_ts_rs1460
+
+```
+
+
+\pagebreak
+
+#### Aggregated RMSE
+
+To facilitate comparison with the other methods, the forecasted travel times for each road segment are aggregated and the forecasted mean travel time for each day is compared against the actual mean overall travel time for each day. The forecasted travel times are plotted below (Figure \@ref(fig:forecastgraphs)). 
+
+
+```{r forecastgraphs, echo=FALSE, fig.cap="Forecasted aggregated daily travel times for the last seven days in January. The red dashed lines represent forecasted values, while the black solid lines represent actual values."}
+par(mfrow=c(2,2))
+D1forecast <- matplot(cbind(ts_df[24:30],pre.star_all$values), type="l", xlab="Time lag", ylab= "Travel time (s/m)", main = "Forecast for D1") # D1
+D2forecast <- matplot(cbind(ts_df[24:30],pre.star_all2$values), type="l", xlab="Time lag", ylab= "Travel time (s/m)", main = "Forecast for D2") # D2
+E1forecast <- matplot(cbind(ts_df[24:30],pre.starweek_all$values), type="l", xlab="Time lag", ylab= "Travel time (s/m)", main = "Forecast for E1") # E1
+E2forecast <- matplot(cbind(ts_df[24:30],pre.starweek_all2$values), type="l", xlab="Time lag", ylab= "Travel time (s/m)", main = "Forecast for E2") # E2
+
+```
+
+
+RMSEs are calculated for each of these models to quantitatively evaluate model fit. The RMSEs for each of the models are shown in Figure \@ref(fig:STARIMARMSE). 
+
+Several observations can be drawn from the RMSE values. 
+
+1. Model E1 (weekly differenced MA model) performs the best, and has the lowest RMSE of 0.0186. Thus, it will be used for comparison against other approaches.
+
+2. Inclusion of an autoregressive term causes the weekly differenced mixed AR, MA model (E2) to perform slightly worse (RMSE of 0.0190) compared to a weekly differenced pure MA model (E1). This is unexpected as inclusion of the previous day's values is predicted to facilitate forecasting. Consequently, this suggests that weekly differencing is sufficient to account for the patterns in travel times.
+
+3. Weekly differenced models (E1 and E2) perform better than undifferenced models (D1 and D2).This indicates that travel times are highly dependent on the day of the week. This might be because Westminster is located in Central London, and is therefore highly influenced by commuting patterns of workers.
+
+4. A sharp improvement in model fit is observed with the inclusion of an AR term in the undifferenced data. For the undifferenced data, the pure MA model (D1) has high RMSE of 0.151, compared to the mixed AR, MA model (D2) which has an RMSE of 0.0230. This indicates that the previous day's travel times are very significant in forecasting the following day's travel times when weekly patterns are not taken into consideration. However, the opposite is observed when weekly patterns are considered -- model E2 performs slightly worse than E1, indicating that weekly differencing is perhaps more important compared to the previous day's travel times and forecast errors.
+
+
+```{r STARIMARMSE,  echo=FALSE, fig.cap="RMSEs of aggregated daily travel times for all 4 STARIMA models"}
+
+AggRMSE_df <- data.frame(
+  Models = c('D1 STARIMA(0,0,1)','D2 STARIMA(1,0,1)','E1 STARIMA(0,0,1)(0,1,1)7','E2 STARIMA(1,0,1)(0,1,1)7'),
+  RMSE = c(nodiff_acc_res[1,2], nodiff_acc_res2[1,2], weekly_acc_res[1,2],weekly_acc_res2[1,2])
+)
+AggRMSE_df$RMSE_4sf <- signif(AggRMSE_df$RMSE,4)
+
+
+agg_RMSE <- ggplot(data=AggRMSE_df, aes(y=RMSE, x=Models, group=1)) +
+  geom_bar(stat='identity',width=0.3)+ 
+  geom_text(aes(label=RMSE_4sf), position=position_dodge(width=0.9), vjust=-0.25)
+agg_RMSE
+
+par(mfrow=c(1,1))
+
+```
+
+
+\pagebreak
+
+## Model Aggregated Daily Travel Time with SVR
+
+### SVM
+
+Support Vector Machine (SVM) is an example of a non-parametric method. Non-parametric methods use a sample of the data to derive a model to predict values. The main distinction between the two methods is that parametric methods have a finite number of parameters whilst this number grows (potentially infinitely) with the amount of data available for non-parametric models. They aim to determine a model without having to estimate the parameters. 
+
+SVM is a type of supervised learning method under Machine Learning which aims to analyze data and recognize the underlying patterns. It is most commonly used for classification purposes (Support Vector Classification / SVC), but it can and has been adapted to support regression in the form of Support Vector Regression (SVR). It has a distinct advantage over other methods such as Artificial Neural Networks as it produces an optimal global solution instead of suffering from multiple local minima. 
+
+Within a dataset, SVC operates by maximizes the separation between the classes using quadratic optimization. Within Machine Learning, this 'line' of separation is referred to as the hyperplane. SVM aims to maximize the distance between points and the hyperplane with the largest maximum margin possible. The support vectors are the closest vectors on the margins, which help to define the hyperplane (Figure \@ref(fig:svmdiagram), adapted from [@Gandhi2018]).
+
+
+```{r, include = FALSE}
+svmdiagram <- "t_svr_images/svmdiagram.png"
+svcsvr <- "t_svr_images/svcsvr.png"
+```
+
+
+```{r svmdiagram, echo=FALSE, fig.align = "center", fig.cap="SVM Diagram (Source: Gandhi 2018)"}
+include_graphics(svmdiagram, dpi = 100)
+```
+
+
+There are two main parameters within SVM: the kernel parameters (I) and the constant C. The kernel parameter is important as it determines the complexity of the solution. The constant 'C' (also referred to as the cost parameter) is the amount of allowable errors in the solution. It is a tradeoff between training error and strictness of the margins. The larger C is, the stricter it is with allowable errors. 
+
+### SVR
+
+Within SVR, an epsilon parameter becomes important as it determines the width of the 'tube' the regression tries to contain the errors in. This contrasts with SVC as it seeks to keep values separated as far as possible from the hyperplane. Figure \@ref(fig:svcsvr) illustrates this difference below.
+
+
+```{r svcsvr, echo=FALSE,fig.align = "center",  out.width = "400px", fig.cap="Difference between SVC and SVR (Source: Lee and Choo 2016)"}
+include_graphics(svcsvr)
+```
+
+
+SVR can be linear or non-linear (parametric or non-parametric) depending on the kernel function used. Some kernel functions such as radial basis kernels help to map data from an input space to a higher dimensional feature space, which help to solve non-linear problems. 
+
+### Experimental set up
+
+First, a time series model was built using a temporal autoregressive structure as there are no information on the predictors of travel time and traffic flow. This allows for forecasting future travel time as a function of previous travel times. The data was embedded to create a matrix that can conduct one-step ahead forecasting using the first m columns as the independent variable and the last (i.e. the original values) as the dependent variable. Different values of m (m = 3, 5, 6, 7) were tested. In other words, m refers to the number of previous days values used for forecasting. As SVR relies on the training set to exhibit all the various situations, this value would consequently impact the forecasting quality.
+
+The data was then divided up into training and testing data. As data frame sizes varied based on the embedding dimension value, the exact numbers of the training dataset differed. However, testing data was set to the last 7 days of January. For example, if m=3, the length of the dataset would be 27 instead of 30. The training dataset would have 20 values, and the rest would be allocated for testing.
+
+Afterwards, the model was trained using a k-fold cross-validation, using k = 5. A k-fold cross-validation helps to prevent overfitting the model on the particular subset of the training set by partitioning the data randomly into k folds. Each of these folds are then left out and the remainder are used to train the model and predict values. Grids of parameters were created to test the model, apart from epsilon values as the `caret` package does not offer this feature. Instead, epsilon values were locked at 0.1.  Radial Basis Function kernel was used for this project as it has achieved better performance in other works [@Dibike2001; @Keerthi2003].
+
+Although k-fold cross-validation can be more computationally expensive compared to other validation methods such as holdout method, it is less biased on how the training and testing datasets were divided. Furthermore, as the k-fold cross-validation runs through each fold once and then subsequently used to train the model k-1 times, it results in a lower variance.
+
+From the model chosen by the k-fold cross-validation, characteristics such as the proportion of points used as support vectors, the training error, and the prediction training error were investigated. The temporal autocorrelation of the residuals of these models were tested. Finally, all the models were collated and compared to find the optimal model with the lowest prediction RMSE value. RMSE values were used instead of other similar metrics such as Mean Absolute Error as it places a high weight on large errors thus being more appropriate when large errors are not desirable [@Wesner2016].
+
+```{r m_3_F, include=FALSE}
+#Model F and variants
+m=3
+svr_data_3 <- embed(ts_df, dimension = m+1)
+colnames(svr_data_3) <- c("d_t-3", "d_t-2", "d_t-1", "d_t")
+n_svr_3 <- nrow (svr_data_3) #27
+svr_split_3 <- ceiling(n_svr_3*0.74)
+F_yTrain <- svr_data_3[1:svr_split_3,1]
+F_XTrain <- svr_data_3[1:svr_split_3,-1]
+F_yTest <- svr_data_3[(svr_split_3+1):nrow(svr_data_3),1]
+F_XTest <- svr_data_3[(svr_split_3+1):nrow(svr_data_3),-1]
+#Cross validation using `caret` package - k-fold cross validation
+library(caret)
+set.seed(1234)
+ctrl <- trainControl(method = "cv", number=5)
+F1_GridCoarse <- expand.grid(.sigma=c(0.001, 0.01, 0.1, 1), .C=c(1, 10,100,1000))
+system.time(F1_GridCoarse <- train(F_XTrain, F_yTrain, method="svmRadial", tuneGrid=F1_GridCoarse
+                       , trControl=ctrl, type="eps-svr"))
+F1_GridCoarse #sigma = 0.01 and C = 100.
+F1 <- F1_GridCoarse
+F1
+plot(F1)
+F1$finalModel@nSV #19
+F1$finalModel@nSV/length(F_yTrain) #0.95
+F1$finalModel@error #0.4259454
+F1_yPred <- predict(F1, F_XTest)
+F1_yPred
+plot(F_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(F1_yPred, col = "red")
+points(F1_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+F1_accur <- accuracy(ts(F1_yPred), ts_df[24:30])
+F1_accur #0.01620417 rmse
+F1_pltClass <- F1_GridCoarse$finalModel@fitted
+F1_pltClass[F1_GridCoarse$finalModel@SVindex] <- 2
+brks <- c(-2, 2)
+F1_lbls <- findInterval(F1_pltClass, brks)
+cols <- c("black", "red")
+plot(F_yTrain, col = cols[F1_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+F1_SVRResidual <- F_yTest-F1_yPred
+plot(F1_SVRResidual)
+acf(F1_SVRResidual)
+#####testing with bigger range of sigma and C
+set.seed(1234)
+F2_GridFit <- expand.grid(.sigma= c(0.001, 0.005, 0.004, 0.002, 0.003, 0.007, 0.008, 0.009, 0.08), .C=c(1, 10, 100))
+system.time(F2_GridFit <- train(F_XTrain, F_yTrain, method="svmRadial", tuneGrid=F2_GridFit
+                       , trControl=ctrl, type="eps-svr"))
+F2_GridFit #sigma = 0.08, c=10 RMSE = 0.02302331
+plot(F2_GridFit)
+F2 <- F2_GridFit
+F2
+F2$finalModel@nSV #18
+F2$finalModel@nSV/length(F_yTrain) #0.9
+F2$finalModel@error #0.2983415
+F2_yPred <- predict(F2, F_XTest)
+plot(F_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(F2_yPred, col = "red")
+points(F2_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+F2_pltClass <- F2$finalModel@fitted
+F2_pltClass[F2$finalModel@SVindex] <- 2
+F2_lbls <- findInterval(F2_pltClass, brks)
+plot(F_yTrain, col = cols[F2_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data (F2)")
+F2_SVRResidual <- F_yTest-F2_yPred
+plot(F2_SVRResidual)
+acf(F2_SVRResidual)
+F2_accur <- accuracy(ts(F2_yPred), ts_df[24:30])
+F2_accur
+```
+
+```{r m_4_G, include = FALSE}
+#Model G and variants
+m=4
+svr_data_4 <- embed(ts_df, dimension = m+1)
+colnames(svr_data_4) <- c("d_t-4", "d_t-3", "d_t-2", "d_t-1", "d_t")
+n_svr_4 <- nrow (svr_data_4) #26
+svr_split_4 <- ceiling(n_svr_4*0.73) #I need 19 here
+G_yTrain <- svr_data_4[1:svr_split_4,1]
+G_XTrain <- svr_data_4[1:svr_split_4,-1]
+G_yTest <- svr_data_4[(svr_split_4+1):nrow(svr_data_4),1]
+G_XTest <- svr_data_4[(svr_split_4+1):nrow(svr_data_4),-1]
+#Cross validation using `caret` package - k-fold cross validation
+set.seed(1234)
+G_GridCoarse <- expand.grid(.sigma=c(0.001, 0.01, 0.1, 1), .C=c(1, 10,100,1000))
+system.time(G_GridCoarse <- train(G_XTrain, G_yTrain, method="svmRadial", tuneGrid=G_GridCoarse
+                         , trControl=ctrl, type="eps-svr"))
+G_GridCoarse
+G1 <- G_GridCoarse
+plot(G1)
+G1$finalModel@nSV #18
+G1$finalModel@nSV/length(G_yTrain) #0.9473684
+G1$finalModel@error #0.2731022
+G1_yPred <- predict(G1, G_XTest)
+plot(G_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(G1_yPred, col = "red")
+points(G1_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+G1_accur <- accuracy(ts(G1_yPred), ts_df[24:30])
+G1_accur #RMSE 0.01378069
+G1_pltClass <- G1$finalModel@fitted
+G1_pltClass[G1$finalModel@SVindex] <- 2
+G1_lbls <- findInterval(G1_pltClass, brks)
+plot(G_yTrain, col = cols[G1_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+G1_SVRResidual <- G_yTest-G1_yPred
+plot(G1_SVRResidual)
+acf(G1_SVRResidual)
+#####testing with bigger range of sigma and C
+set.seed(1234)
+G_GridFit <- expand.grid(.sigma= c(0.001, 0.005, 0.004, 0.002, 0.003, 0.007, 0.008, 0.009, 0.08), .C=c(1, 10, 100))
+system.time(G_GridFit <- train(G_XTrain, G_yTrain, method="svmRadial", tuneGrid=G_GridFit
+                   , trControl=ctrl, type="eps-svr"))
+G_GridFit #sigma = 0.009 and C = 100 RMSE = 0.02131522
+G2 <- G_GridFit
+plot(G2)
+G2$finalModel@nSV #17
+G2$finalModel@nSV/length(G_yTrain) #0.8947368
+G2$finalModel@error #0.2892902
+G2_yPred <- predict(G2, G_XTest)
+plot(G_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(G2_yPred, col = "red")
+points(G2_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+G2_pltClass <- G2$finalModel@fitted
+G2_pltClass[G2$finalModel@SVindex] <- 2
+G2_lbls <- findInterval(G2_pltClass, brks)
+plot(G_yTrain, col = cols[G2_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+G2_SVRResidual <- G_yTest-G2_yPred
+plot(G2_SVRResidual)
+acf(G2_SVRResidual)
+G2_accur <- accuracy(ts(G2_yPred), ts_df[24:30])
+G2_accur #rmse 0.01386994
+```
+
+```{r m_5_H, include=FALSE}
+#Model H and variants
+m=5
+set.seed(1234)
+svr_data5 <- embed(ts_df, dimension = m+1)
+colnames(svr_data5) <- c("d_t-5", "d_t-4", "d_t-3", "d_t-2", "d_t-1", "d_t")
+n_svr5 <- nrow (svr_data5) #25
+svr_split5 <- ceiling(n_svr5*0.72)
+svr_split5
+H_yTrain <- svr_data5[1:svr_split5,1]
+H_XTrain <- svr_data5[1:svr_split5,-1]
+H_yTest <- svr_data5[(svr_split5+1):nrow(svr_data5),1]
+H_XTest <- svr_data5[(svr_split5+1):nrow(svr_data5),-1]
+#Cross validation using `caret` package - k-fold cross validation
+H1 <- expand.grid(.sigma=c(0.001, 0.01, 0.1, 1), .C=c(1, 10,100,1000))
+system.time(H1 <- train(H_XTrain, H_yTrain, method="svmRadial", tuneGrid=H1
+                         , trControl=ctrl, type="eps-svr"))
+H1 #sigma = 0.1 and C = 1
+plot(H1)
+H1$finalModel@nSV #17
+H1$finalModel@nSV/length(H_yTrain) #0.94444
+H1$finalModel@error #0.3345778
+H1_yPred <- predict(H1, H_XTest)
+plot(H_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(H1_yPred, col = "red")
+points(H1_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+H1_accur <- accuracy(ts(H1_yPred), ts_df[24:30])
+H1_accur #RMSE 0.01337283
+H1_pltClass <- H1$finalModel@fitted
+H1_pltClass[H1$finalModel@SVindex] <- 2
+H1_lbls <- findInterval(H1_pltClass, brks)
+plot(H_yTrain, col = cols[H1_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+H1_SVRResidual <- H_yTest-H1_yPred
+plot(H1_SVRResidual)
+acf(H1_SVRResidual)
+##Fine tuning
+set.seed(1234)
+H2 <- expand.grid(.sigma=c(0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.015, 0.1), .C=c(1, 10,100,1000))
+system.time(H2 <- train(H_XTrain, H_yTrain, method="svmRadial", tuneGrid=H2
+            , trControl=ctrl, type="eps-svr"))
+H2 #sig = 0.015, C = 10 RMSE 0.02162551
+plot(H2)
+H2$finalModel@nSV #17
+H2$finalModel@nSV/length(H_yTrain) #0.9444444
+H2$finalModel@error #0.385591
+H2_yPred <- predict(H2, H_XTest)
+plot(H_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(H2_yPred, col = "red")
+points(H2_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+H2_accur<- accuracy(ts(H2_yPred), ts_df[24:30])
+H2_accur #rmse 0.01388452
+H2_pltClass <- H2$finalModel@fitted
+H2_pltClass[H2$finalModel@SVindex] <- 2
+H2_lbls <- findInterval(H2_pltClass, brks)
+plot(H_yTrain, col = cols[H2_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+H2_SVRResidual <- H_yTest-H2_yPred
+plot(H2_SVRResidual)
+acf(H2_SVRResidual)
+```
+
+```{r m_6_I, include=FALSE}
+#Model I and variants
+set.seed(1234)
+m=6
+svr_data6 <- embed(ts_df, dimension = m+1)
+colnames(svr_data6) <- c("d_t-6","d_t-5", "d_t-4", "d_t-3", "d_t-2", "d_t-1", "d_t")
+n_svr6 <- nrow (svr_data6) #24
+n_svr6
+svr_split6 <- ceiling(n_svr6*0.70)
+svr_split6
+I_yTrain <- svr_data6[1:svr_split6,1]
+I_XTrain <- svr_data6[1:svr_split6,-1]
+I_yTest <- svr_data6[(svr_split6+1):nrow(svr_data6),1]
+I_XTest <- svr_data6[(svr_split6+1):nrow(svr_data6),-1]
+#Cross validation using `caret` package - k-fold cross validation
+I1 <- expand.grid(.sigma=c(0.001, 0.01, 0.1, 1), .C=c(1, 10,100,1000))
+system.time(I1 <- train(I_XTrain, I_yTrain, method="svmRadial", tuneGrid=I1
+                        , trControl=ctrl, type="eps-svr"))
+I1 #sigma = 0.1 and C = 1 RMSE0.02486248
+plot(I1)
+I1$finalModel@nSV #17
+I1$finalModel@nSV / length(I_yTrain) #1 - i.e. 100% all in
+I1_pltClass <- I1$finalModel@fitted
+I1_pltClass[I1$finalModel@SVindex] <- 2
+I1_lbls <- findInterval(I1_pltClass, brks)
+plot(I_yTrain, col = cols[I1_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+I1$finalModel@error #0.2823805
+I1_yPred <- predict(I1, I_XTest)
+I1_accur <- accuracy(ts(I1_yPred), ts_df[24:30])
+I1_accur #rmse 0.01400886
+plot(I_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(I1_yPred, col = "red")
+points(I1_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+I1_SVRResidual <- I_yTest-I1_yPred
+plot(I1_SVRResidual)
+acf(I1_SVRResidual)
+#Finetuning
+set.seed(1234)
+I2 <- expand.grid(.sigma=c(0.09, 0.1, 0.2, 0.3, 0.4), .C=c(10, 100, 1000))
+system.time(I2 <- train(I_XTrain, I_yTrain, method="svmRadial", tuneGrid=I2
+            , trControl=ctrl, type="eps-svr"))
+I2 #sig = 0.2, C = 10 RMSE 0.02539840
+plot(I2)
+I2$finalModel@nSV #17
+I2$finalModel@nSV/length(I_yTrain) #1
+I2$finalModel@error #0.01001574
+I2_yPred <- predict(I2, I_XTest)
+plot(I_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(I2_yPred, col = "red")
+points(I2_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+I2_accur <- accuracy(ts(I2_yPred), ts_df[24:30])
+I2_accur #0.01103354
+I2_SVRResidual <- I_yTest-I2_yPred
+plot(I2_SVRResidual)
+acf(I2_SVRResidual)
+I2_pltClass <- I2$finalModel@fitted
+I2_pltClass[I2$finalModel@SVindex] <- 2
+I2_lbls <- findInterval(I2_pltClass, brks)
+plot(I_yTrain, col = cols[I2_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+```
+
+```{r m_7_J, include = FALSE}
+set.seed(1234)
+m=7
+svr_data_7 <- embed(ts_df, dimension = m+1)
+colnames(svr_data_7) <- c("d_t-7", "d_t-6", "d_t-5", "d_t-4", "d_t-3", "d_t-2", "d_t-1", "d_t")
+n_svr_7 <- nrow (svr_data_7) #23
+svr_split_7 <- ceiling(n_svr_7*0.69)
+J_yTrain <- svr_data_7[1:svr_split_7,1]
+J_XTrain <- svr_data_7[1:svr_split_7,-1]
+J_yTest <- svr_data_7[(svr_split_7+1):nrow(svr_data_7),1]
+J_XTest <- svr_data_7[(svr_split_7+1):nrow(svr_data_7),-1]
+#Cross validation using `caret` package - k-fold cross validation
+J1 <- expand.grid(.sigma=c(0.001, 0.01, 0.1, 0.5, 1), .C=c(1, 10,100,1000))
+system.time(J1 <- train(J_XTrain, J_yTrain, method="svmRadial", tuneGrid=J1
+                          , trControl=ctrl, type="eps-svr"))
+J1 #sigma = 0.001 and C = 100, RMSE 0.02176870
+plot(J1)
+J1$finalModel@nSV #14
+(J1$finalModel@nSV)/length(J_yTrain) # 0.875
+J1$finalModel@error #0.3630428
+J1_yPred <- predict(J1, J_XTest)
+plot(J1_yPred, type = "l", xaxt="n", xlab="January Date", ylab="Time", col = "red")
+points(J1_yPred, col="red", pch=21, bg = "red")
+lines(J_yTest, col = "black")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+J1_SVRResidual <- J_yTest-J1_yPred
+plot(J1_SVRResidual)
+acf(J1_SVRResidual)
+J1_pltClass <- J1$finalModel@fitted
+J1_pltClass[J1$finalModel@SVindex] <- 2 #setting values to be 2 if they are support vectors
+J1_lbls <- findInterval(J1_pltClass, brks)
+plot(J_yTrain, col = cols[J1_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+J1_accur <- accuracy(ts(J1_yPred), ts_df[24:30])
+J1_accur #rmse 0.01918214
+##Refining Model
+set.seed(1234)
+J2 <- expand.grid(.sigma=c(0.09, 0.1, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.2), .C=c(1,10,100,1000))
+system.time(J2 <- train(J_XTrain, J_yTrain, method="svmRadial", tuneGrid=J2
+            , trControl=ctrl, type="eps-svr"))
+J2 #sigma = 0.1, C = 1, RMSE 0.02245262
+plot(J2)
+J2$finalModel@nSV #15
+(J2$finalModel@nSV)/length(J_yTrain) #0.9375 % are support vectors
+J2$finalModel@error #0.2217186
+J2_yPred <- predict(J2, J_XTest)
+plot(J2_yPred, type = "l", xaxt="n", xlab="January Date", ylab="Time", col = "red")
+points(J2_yPred, col="red", pch=21, bg = "red")
+lines(J_yTest, col = "black")
+axis(1, at=1:7, labels = 24:30)
+legend(3,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(4.5, 0.22, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+J2_SVRResidual <- J_yTest-J2_yPred
+plot(J2_SVRResidual)
+acf(J2_SVRResidual)
+J2_pltClass <- J2$finalModel@fitted
+J2_pltClass[J2$finalModel@SVindex] <- 2
+J2_lbls <- findInterval(J2_pltClass, brks)
+plot(J_yTrain, col = cols[J2_lbls], pch=16, xlab="January Dates", ylab="Time")
+legend(("topleft"),legend=c("Not Support Vector", "Support Vector"), fill =cols, title = "Class")
+title (main = "SVR Support Vectors in Training Data")
+J2_accur <- accuracy(ts(J2_yPred), ts_df[24:30])
+J2_accur #rmse 0.01190996
+```
+
+
+### Results
+
+Example: M = 3
+
+Two models of m=3 were created with various parameters and underwent k-fold cross-validation (Figure \@ref(fig:3kfold)).
+```{r include=FALSE}
+F1_plot <- plot(F1)
+F2_plot <- plot(F2)
+```
+```{r 3kfold, fig.cap="k-fold cross validation ", echo=FALSE}
+grid.arrange(F1_plot, F2_plot, ncol=1, nrow=2)
+```
+
+```{r, inlude=F}
+Three_Results <- ("Model	m	Sigma	C	Epsilon	Error	RMSE_Training	P_SV	RMSE_Test	MAE	Time
+F1	3	0.01	100	0.1	0.4259454	0.02054946 	95.00	0.01620417	0.01453338	1
+F2	3	0.009	100	0.1	0.4332898	0.01962872 	90	0.01625211	0.014495	1.42
+")
+Three_Results <- read.table(text=Three_Results, header=TRUE)
+```
+
+The performance results show that both models had low RMSE for both training and testing in Table \ref{tab:table1}
+
+```{r table1, echo=FALSE}
+kable(Three_Results, format = "latex", booktabs=T, longtable=T, caption= "\\label{tab:table1} RMSE Results for M=3")%>%
+  kable_styling(font_size=7, latex_options = "hold_position")
+```
+
+A comparison between the predicted and observed values show that the models both overestimate day 5 and underestimate day 6. This is shown clearer by comparing the residuals. In general, the models slightly overestimate the values 
+(Figure \@ref(fig:resids3), Figure \@ref(fig:resids3pt2))
+
+```{r resids3, fig.cap="Comparison between predicted and observed values"}
+par(mfrow = c(1,2))
+plot(F_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(F1_yPred, col = "red")
+points(F1_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(1.5,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(2.5, 0.21, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+title(main = "Observation vs Predicted (F1)")
+plot(F_yTest, type = "l",xaxt="n", xlab="January Date", ylab="Time", col = "black")
+lines(F2_yPred, col = "red")
+points(F2_yPred, col="red", pch=21, bg = "red")
+axis(1, at=1:7, labels = 24:30)
+legend(1.5,0.22, legend=c("Observed"), lty=1, bty="n")
+legend(2.5, 0.21, legend=c("Predicted"), pch=21, col="red", bg="red", bty="n")
+title(main = "Observation vs Predicted (F2)")
+```
+
+```{r resids3pt2, fig.cap ="Residual comparison between models"}
+par(mfrow = c(1,2))
+plot(F1_SVRResidual)
+abline(h=0, col ="black")
+plot(F2_SVRResidual)
+abline(h=0, col ="black")
+```
+
+The residual autocorrelation plots for both models suggest there are no significant temporal autocorrelation present (Figure \@ref(fig:3residsacf))
+
+```{r 3residsacf, fig.cap="Residual autocorrelation plots for models F1 and F2"}
+par(mfrow = c(1,2))
+acf(F1_SVRResidual)
+acf(F2_SVRResidual)
+```
+
+Looking at which values were support vectors from the testing data, F1 has more data included as support vectors. Interestingly, both models did not include Day 3 as a support vector (Figure \@ref(fig:3sv))
+
+```{r 3sv, fig.cap="Support vectors and Non-support vectors for F1 and F2", fig.height = 8, fig.size = 7}
+layout(matrix(c(1,2, 3, 3), 2, 2, byrow = TRUE), heights=c(2, 0.8))
+plot(F_yTrain, col = cols[F1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "F1")
+plot(F_yTrain, col = cols[F2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "F2")
+plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("center", legend=c("Not Support Vector", "Support Vector"), pch=16, pt.cex=1, cex=1, bty='n',
+    col = cols)
+mtext("Class", cex=1)
+```
+
+When determining which was the better model, there was an interesting dilemma while looking at the model performance. (Table \ref{tab:table1})
+
+Whilst F2 had a lower RMSE value for the training set, F1 ultimately had the better model for testing with a lower RMSE score. F1 also incorporated more of the data as support vectors (95%) compared to F2 (90%). This result suggests that F2 may have been overfitted as it performs better on data it has already seen compared to on data it has not seen. Both testing RMSE scores were closer to the MAE value, which implies that the models both make many relatively weak errors compared to few but larger errors. Additionally, in terms of duration, F2 had a longer elapsed time of `1.42` compared to F1's `1`.
+
+This process was repeated for the rest of the models (G-J) with m = 4:7. Only the best models of each embedding dimension value are shown below, and the rest are available in the Appendix.
+
+The best models of each embedding dimension value are shown below in Table \ref{tab:table2}, as well as their k-fold cross-validation result (Figure \@ref(fig:svrkfold))
+
+
+```{r table2, echo =FALSE}
+t_svr_results <- ("m	Sigma	C	Epsilon	Error	RMSE_Training	P_SV	RMSE_Test	MAE	Time
+3	0.01	100	0.1	0.4259454	0.02054946 	95.00	0.01620417	0.01453338	1
+4	0.01	10	0.1	0.2731022	0.02144962	94.74	0.01378069	0.01075342	1.01
+5	0.015	10	0.1	0.385591	0.01877293 	94.44	0.01388452	0.01180915	1.75
+6	0.1	1	0.1	0.2823805	0.02486248 	100	0.01400886	0.01322395	1.0
+7	0.09	1	0.1	0.2217186	0.02245262	93.75	0.01190996	0.01007018	1.85")
+
+t_svr_results <- read.table(text=t_svr_results, header=TRUE)
+knitr::kable(t_svr_results, format = "latex", booktabs=T, caption = "\\label{tab:table2}. Results of best models for each embedding dimension")%>%
+  kable_styling(font_size=7, full_width=T, latex_options = "hold_position")
+```
+
+```{r include=F}
+G1_plot <- ggplot(G1) + theme(axis.title.y=element_blank()) 
+F1_plot <- ggplot(F1) + theme(axis.title.y=element_blank()) 
+H2_plot <- ggplot(H2) + theme(axis.title.y=element_blank()) 
+I1_plot <- ggplot(I1) + theme(axis.title.y=element_blank()) 
+J2_plot <- ggplot(J2) + theme(axis.title.y=element_blank()) 
+```
+```{r svrkfold, fig.height=8, fig.size=9, fig.cap="K fold validation results (F to J)"}
+grid.arrange(F1_plot, G1_plot, H2_plot, I1_plot, J2_plot, nrow = 5, ncol=1)
+
+```
+
+
+When comparing the observed and predicted values, it is clear that all the models followed the general pattern where travel flow tends to increase from Monday and reaches a high on Friday followed by a sharp decrease during the weekend (Figure \@ref(fig:svrresids)). No one model encapsulates the pattern completely. For example,  G1 encapsulates the pattern in the early days, but fails to do so after Day 28. Although only I1 and J2 exhibit a decrease between Days 28-29, the other models soon follow suit between days 29-30 to arrive at a similar travel time prediction. Models F1,G1,and H2 all reach their peak on day 29, lagging a day behind.
+
+```{r svrresids, fig.cap="Observed vs Predicted"}
+par(mfrow = c(1, 1))
+plot(ts_df[24:30], type = "l", xaxt="n", xlab="January Date", ylab="Time", col = "black")
+axis(1, at=1:7, labels = 24:30)
+lines(F1_yPred, col = "red")
+points(F1_yPred, col="red", pch=21, bg = "red")
+lines(G1_yPred, col = "blue")
+points(G1_yPred, col="blue", pch=21, bg = "blue")
+lines(H2_yPred, col = "green")
+points(H2_yPred, col="green", pch=21, bg = "green")
+lines(I1_yPred, col = "purple")
+points(I1_yPred, col="purple", pch=21, bg = "purple")
+lines(J2_yPred, col = "yellow")
+points(J2_yPred, col="yellow", pch=21, bg = "yellow")
+legend(3,0.24, legend=c("Observed", "Predicted (F1)", "Predicted (G1)", "Predicted (H2)",
+                        "Predicted (I1)", "Predicted (J2)"),
+       col=c("black", "red", "blue", "green", "purple", "yellow"), lty=1)
+title(main = "Observation vs Prediction")
+```
+
+Residual plots indicate that all models at 5 all overestimate the prediction value. Most of the models apart from two (F1, H2) underpredict most of the values, whilst the rest overpredicts them (Figure \@ref(fig:svrresids2))
+
+```{r svrresids2, fig.cap="Residuals of all models at 5"}
+par(mfrow = c(3, 2))
+plot(F1_SVRResidual, col = "red", pch=21, bg="red")
+abline(h=0,col="black")
+plot(G1_SVRResidual, col = "blue", pch =21, bg ="blue")
+abline(h=0,col="black")
+plot(H2_SVRResidual, col = "green", pch = 21, bg="green")
+abline(h=0,col="black")
+plot(I1_SVRResidual, col = "purple", pch = 21, bg = "purple")
+abline(h=0,col="black")
+plot(J2_SVRResidual, col = "yellow", pch = 21, bg = "yellow")
+abline(h=0,col="black")
+par(mfrow = c(1, 1))
+```
+
+None of the model exhibited significant residual autocorrelation (Figure \@ref(fig:svrresidsacf)).
+
+```{r svrresidsacf, fig.cap="Residual autocorrelation after model fit"}
+par(mfrow = c(3, 2))
+acf(F1_SVRResidual)
+acf(G1_SVRResidual)
+acf(H2_SVRResidual)
+acf(I1_SVRResidual)
+acf(J2_SVRResidual)
+par(mfrow = c(1, 1))
+```
+
+All the models incorporated most of the data as support vectors. I1 incorporated all the data as support vectors within the model. 
+
+#### Best Model
+
+From Figure \@ref(fig:tsvr_sv), the best model for time-series SVR in this project would be J2, which uses `m=7`, as it has the lowest `RMSE_Test` value. Additionally, it also has the lowest Training error value of 0.2217186. As the `RMSE_Test` value is closer to `MAE` value than the `MAE^2` value, it also suggests that although the model may make many errors, these errors would be relatively small. Although F2 had the longest elapsed time of `1.85`, it portrays the trend as close as possible to the testing data, which is intuitive as the time series showed there was a weekly seasonality.
+
+```{r tsvr_sv, fig.height=5, fig.size=8, echo=FALSE}
+par(mfrow = c(3, 2))
+plot(F_yTrain, col = cols[F1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (F1)")
+plot(G_yTrain, col = cols[G1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (G1)")
+plot(H_yTrain, col = cols[H2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (H2)")
+plot(I_yTrain, col = cols[I1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (I1)")
+plot(J_yTrain, col = cols[J2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (J2)")
+plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("topleft", legend=c("Not Support Vector", "Support Vector"), pch=16, pt.cex=3, cex=1.5, bty='n',
+    col = cols)
+mtext("Class", at=0.2, cex=1)
+par(mfrow = c(1, 1))
+```
+
+
+\pagebreak
+
+## Model daily travel time data on each of the road segments with ST-SVR 
+
+### SVM
+
+In machine learning, Support Vector Machine (SVM) is a supervised learning model and related learning algorithms for analysing data in classification and regression analysis. A vector represents a sample point and each sample is a row of data. The sample points on the decision plane are the support vectors (SV) and these vectors fall out the boundary of margin (see figure below). Given a set of training entities, each of which is marked as belonging to one or the other of the two categories, the SVM training algorithm creates a model that assigns the new entity to one of the two categories, making it non-probabilistic binary linear classification. Furthermore, a method for creating nonlinear classification by applying kernel techniques to the maximum margin hyperplane was proposed by @Boser1992. SVM is used below to classify the specific training values and tested values of last seven days. 
+
+![Support Vectors (Alpaydin, 2014)](st_svr_images/supportvectors.png)
+
+### SVR
+
+Support Vector Regression (SVR) uses SV to complete the regression, which is essentially similar to SVM. In SVR, there are two significant parameters, constant C which is used for limited the errors producing in the data training session and epsilon which describes the width of the specific region to define the point loss in this region as 0. Within the constraints, the model is looking for a strip instead of a simple line, also the model can be non-linear. SVR provides an optimal model with rather lower root mean square error (RMSE). 
+
+### Preparation for setting up the space time models
+
+#### Fitting an SVR model
+
+Setting different m values for testing and m = 3, 4, 5, 6, 7, 8 have been used here. The m value means creating a new matrix with how much columns will be created based on the data frame with a time series (ts), which is an important parameter for data embeding. The matrix is used for one step ahead forecasting. The data training method used here is K-fold cross-validation with parameter k = 5 to separate K subsamples, a single subsample is retained as data for the validation model, and the other K-1 samples are used for training [@park2015]. Afterwards, a grid of parameters is created to train and test the model with unchanged epsilon value but changeable sigma and C. Hence, suitable sigma and C can be found in the random values by trying set range of sigma and C in order to show the best model performance. 
+
+#### SVM Classification 
+
+SVM classification is used for classifying support vectors and non-support vectors. Setting the breaking points to separate the data is vital to decide which value falls to which class. The points are set as (-1, 1, 2) mainly because the points in the initial data fall into this range. 
+  
+As for the SVM classification, when m=6, all the values are support vectors (see figure below). One more essential point is worth to be mentioned that the data of day three has not been taken into consideration for the reason that it is undefined, even it was replaced with average values of neighbour values in the initial data processing. 
+
+![Classification of training values](st_svr_images/classificationtraining.png)
+
+
+### Result: Comparison of accuracy of different models based on different m values 
+
+Whilst finishing the preparation above, the model can be used for one step ahead prediction and plot the results for each embeding dataset independently. From the results showed in the figures, when m = 5 and m = 6, the training data provide well matched predicted models. For m = 5, predicted values fall into the same range of tested one but with slight difference especially after the date of 27, the difference has slightly expanding trend (see left figure below). As for m = 6, the predicted model has the similar pattern with the tested one but rather larger difference with tested one (see right figure below). Interestingly, when after the date of 28, the predicted model gradually merges with the tested data. Hence, based on these results, it is still difficult to know which set of embeding data to be used in the space-time model building. Further verification is probably needed. 
+
+![Left: Prediction VS Observation (m = 5), Right: Prediction VS Observation (m = 6)](st_svr_images/res1.png)
+
+According to the table below, when m = 6, there is the smallest RMSE also with other errors within the allowable range. 
+
+![The accuracy of different models based on different m values](st_svr_images/tabl1.png)
+
+### Building up space-time model
+
+The space-time model built up is for the purpose of prediction that forecasts the last seven days situation of traffic flows for each road in Westminster Borough on January of 2011. The model is set up with its own previous data, ts, the embeding data which means it uses the matrix created when m = 6 and spatial weight matrix which defines from the dataset of roads in Westminster. All the undefined data in the spatial weight matrix is replaced by 0. 
+
+The ts is vital for data training, which is set up by coding mathematic functions to convert real time values to numbers which can used as time series in training session. Also, the space-time series for each specific road is needed, which embeds the series of a particular location along with its adjacent neighbours. According to the embeding data, the data for training and testing are separated. 
+
+Afterwards, the kernel function is used to train the data so as to set up the space-time model. As mentioned above, space-time models for each location will be set up to conduct the prediction. After completing these models, the last seven days prediction can be carried out. 
+
+In the results of these predicted space-time models, specific conclusion can be drawn. In the last seven days, the models of location 2364 (see left figure below) and location 435 (see right figure below) show the busiest traffic situation and with smallest traffic flows among 25 locations respectively. 
+
+![Left: Predicted Space-time Model (Location 2364), Right: Predicted Space-time Model (Location 435)](st_svr_images/res2.png)
+
+As for the model of location 1576 (see figure below), the predicted pattern is most similar with the tested one over all the predictions.
+
+![Predicted Space-time Model (Location 2364)](st_svr_images/res3.png)
+
+By contrast, space-time models for m = 5 are also produced for the comparison with models of m = 6 for the reason that well fitted model has been carried out above when m = 5. However, those space time models are out of range with the tested one, having similar results with when m = 6. It seems closer to the tested one when m = 6. The model of the location 1576 (see figure below) is rather match with tested one over 25 models, same with m = 6. 
+
+![Predicted Space-time Model (Location 2364)](st_svr_images/res4.png)
+
+Interestingly, the prediction of busiest case and with smallest traffic flows are still location 2364 (see left figure below) and 435 (see right figure below) respectively.
+
+![Left: Predicted Space-time Model (Location 2364), RightPredicted Space-time Model (Location 435)](st_svr_images/res5.png)
+
+As can be seen in these figures, there is still a rather obvious difference between predicted model and tested one even for the most similar one. Also, comparing with the prediction carried out by temporal autoregressive model, space-time model shows lesser accuracy, though the temporal autoregressive one is not completely coincided with the tested one. The reasons cause the rather lower accuracy are complicated based on insufficient information available. However, several significantly related reasons and corresponding resolutions could be summarized below. 
+
+(1) The training data is inadequate. Technically, data stability refers to the stability of time series. However, fundamentally, the stability of the data depends mainly on its variance, especially for uncomplex dataset. The training data is used in modelling is the mean value of each location each day. Additionally, the data training method used here is K-fold cross-validation which is an effective and efficient method but with only first 17 values being trained while building up the model for m = 6. To improve its accuracy, it is worth trying to use the raw data rebuild space-time models again for more usable data. More training data is likely to reduce the contingency when training and reduce the variance of data [@Wang2017]. 
+
+(2) Random seeds are set to be able to generate a series of random numbers to train the data. However, random numbers generated by the random seeds are actually pseudo-random numbers, which are with regulation. Although it ensures that the results obtained each time are the same, it is not random enough to avoid causing dependency with the same random numbers [@article]. Hence, multiple random seeds should be set for multiple training to carry out a better result. 
+
+(3) Weight matrix includes a large amount of invalid values. Although all the invalid values are replaced by 0, it is still lack of reliance to produce a reliable space-time series. In fact, the weight matrix is adopted from the raw dataset which means it is with flaws so that it is probably unavoidable.
+
+
+\pagebreak 
+
+# Discussion 
+
+This section will compare results of the best models produced using the different modelling approaches. 
+
+```{r}
+overall_plot_df <- data.frame(data_by_day[24:30,]['Day'],ts_df[24:30],pre_3.2$pred,pre.starweek_all$values,J2_yPred)
+names(overall_plot_df) <- c('Dates','Actual','ARIMA','STARIMA','T_SVR')
+
+
+overall_plot <- ggplot(overall_plot_df,aes(Dates,group=1))+
+  geom_line(aes(y=Actual,color="Actual"))+
+  geom_line(aes(y=ARIMA,color="ARIMA"),linetype="dashed")+
+  geom_line(aes(y=STARIMA,color="STARIMA"),linetype="longdash")+
+  geom_line(aes(y=T_SVR,color="T_SVR"),linetype="twodash")+
+  scale_color_manual('Models',values=c("black", "red","blue","orange"))+
+  xlab('Last 7 Days of January') +
+  ylab('Travel Time (s/m)')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+rmse_values <- data.frame(c(acc_3.2[1,2],weekly_acc_res[1,2],J2_accur[1,2]))
+rmse_title <- c("ARIMA","STARIMA","T_SVR")
+rmse_table <- cbind(rmse_title,rmse_values)
+colnames(rmse_table) <- c('Model','RMSE')
+
+overall_RMSE <- ggplot(data=rmse_table, aes(y=RMSE, x=Model, group=1)) +
+  geom_bar(stat='identity',width=0.3)+
+  coord_cartesian(ylim = c(0.010, 0.02))
+#overall_RMSE
+
+```
+
+## Comparing RMSE scores
+
+In general, from the exploratory analysis, it is known that the only observable pattern across all the weeks is that the travel time is significantly shorter on the weekends (Figure \@ref(fig:plottsall2)).
+
+```{r plottsall2, fig.cap="Average daily travel time in s/m across in Westminster."}
+plot_ts_all
+```
+
+Looking at the predictions for the last 7 days across the models, the following plot is obtained (Figure \@ref(fig:combinedpredictions)).
+
+```{r combinedpredictions, fig.cap="Comparison of Predicted Travel Times Among the Models for the Last 7 Days in January"}
+overall_plot
+```
+
+From the plot, it is observed that actual travel times increases from Monday and decreases at the end of the week. This trend is successfully captured in all models.
+
+However, the peaks and troughs of the actual travel time graph are not successfully predicted in all the models. This is expected because there had been no clear weekly patterns for the peaks and troughs and the models were only trained on limited data (23 days).
+
+To quantitatively evaluate the models, RMSE (Figure \@ref(fig:combinedRMSE)) was used.
+
+```{r combinedRMSE,echo=FALSE,message=FALSE,fig.cap="Comparison of RMSEs Among the Models"}
+overall_RMSE
+```
+
+Overall, the SVR model has the lowest RMSE. This denies our third hypothesis:
+
+
+H3. Forecasting time-series with ARIMA gives better accuracy than with SVR
+
+
+It was realised a one-step forecast was implemented in SVR whereas a multi-step forecast was implemented in ARIMA. This means that the SVR model in our case, was privy to the actual last t-1 days of data. A fairer comparison may be to implement a multi-step forecast in SVR -- use predicted values for the last t-1 days to train instead. We hypothesise that a one-step forecast was a significant factor in improving the RMSE score. 
+
+The ARIMA model performed better than the STARIMA model, which confirms our first hypothesis: 
+H1. Modelling aggregated daily travel time by ARIMA is more accurate than modelling travel time by road segments by STARIMA and then aggregating it
+
+For H1, this may confirm our hypothesis that given a small amount of data, STARIMA may overfit to each road segment. Also, ARIMA directly models what is to be predicted -- the daily travel time itself -- whereas STARIMA estimates the daily travel time by modelling the daily travel time of each road segment. Estimating travel time for each road segment introduces 25 times more errors as there are 25 road segments.
+
+
+For hypothesis 2 and 4:
+
+H2. Modelling aggregated daily travel time by SVR is more accurate than modelling travel time by road segments by ST-SVR and then aggregating it
+
+H4. Forecasting time-series with STARIMA gives better accuracy than ST-SVR
+
+These hypotheses remain inconclusive as the ST-SVR model was not successfully implemented.
+
+However, as comparisons between ARIMA and STARIMA were successful, this may give some insight of the likely relative performance of ST-SVR. We hypothesise SVR would outperform ST-SVR, given our findings above that ARIMA outperformed STARIMA. 
+
+## Comparing General Model Performance
+
+This section will compare the performance of the 3 models in terms of: runtime, ease of implementation and interpretability.
+
+```{r}
+time_df <- data.frame(Model=c('ARIMA','STARIMA','T_SVR'),Runtime=c(0.0118,0.468,1.85))
+
+overall_time <- ggplot(data=time_df, aes(y=Runtime, x=Model, group=1)) +
+  geom_bar(stat='identity',width=0.3)+
+  geom_text(aes(label=Runtime), position=position_dodge(width=0.9), vjust=-0.25)+
+  ylab("Runtime (s)")
+
+```
+
+### On Runtime
+
+The amount of time taken to train the model and predict the results was recorded for each of the 3 models on the same computer and shown below:
+
+```{r}
+overall_time
+```
+
+The results show that SVR has a significantly longer runtime as compared to ARIMA and STARIMA (it is around 156 times slower than ARIMA). This is due to the fact that it is a machine learning model so it requires time to train and optimise over the parameters (sigma, c, epsilon, etc.). STARIMA is about 40 times slower ARIMA and this is due to the incorporation of the adjacency matrix and that it has to do a prediction for each of the 25 road segments. Hence, ARIMA performs the best in terms of runtime. 
+
+### On Ease of Implementation
+
+For the ease implementation, we think that ARIMA is the easiest to implement. 
+
+As the ARIMA model is from the *forecast* package which open-source, widely used and has properly undergone multiple revisions and improvements, it is likely to be the most user-friendly and reliable. It also has many resources online to guide users through the use of the package. 
+
+While the SVR model was trained and predicted using the *caret* package, which is open-source and well-documented, using it for time-series forecasting requires the data to be prepared in the correct format beforehand. The dimensions of the embedded data was also an additional parameter to be considered. This makes the implementation of the SVR model more tedious that the ARIMA model. 
+
+The STARIMA package is not open-source. This means that there are fewer contributors and users and thus is not as well-developed. 
+
+
+### On Interpretability
+
+For interpretability, ARIMA and STARIMA would be easier to interpret than SVR as they are parametric models where one defines the variables. In contrast, SVR, being a machine learning model, is a black box. Hence, it is also more challenging to interpret results derived from SVR than from ARIMA and STARIMA. 
+
+
+# Conclusion
+
+Overall, in terms of RMSE, the SVR model outperforms the ARIMA and STARIMA model, keeping in mind that the SVR model was a one-step forecast whereas the ARIMA and STARIMA models were multi-step forecasts. In terms of runtime, ease of implementation and interpretability, ARIMA outperforms all the other methods. However, these conclusions can change depending on the nature of the dataset, the size of the dataset and the requirements of the user.
+
+Future work on modelling travel time can look towards incorporating more data, perhaps over several months or years. We could also look at modelling time periods. Travel patterns vary across the day. For example, we might expect the rush hours (9am and 6pm) to have the highest travel time, or even model weekdays separately from weekends.
+
+# Appendix
+
+## Appendix A {#test1}
+```{r test1}
+ts_df %>% ur.kpss() %>% summary() # stationary
+```
+
+## Appendix B {#test2}
+```{r}
+tseries::adf.test(ts_df) # non-stationary
+```
+
+## Appendix C {#test3}
+```{r}
+ts_df %>% diff(lag=1)  %>%  ur.kpss() %>% summary()
+ts_df %>% diff(lag=1)  %>%  tseries::adf.test()
+```
+
+## Appendix D {#test4}
+
+```{r}
+ts_df %>% diff(lag=7) %>% ur.kpss() %>% summary()
+ts_df %>% diff(lag=7) %>% tseries::adf.test()
+```
+
+## Appendix E {#test5}
+
+```{r}
+ts_df %>% diff(lag=7) %>% diff(lag=1) %>% ur.kpss() %>% summary()
+ts_df %>% diff(lag=7) %>% diff(lag=1) %>% tseries::adf.test()
+```
+
+## Appendix F {#diagcheck}
+Diagnostic checking: ACF and Ljung-Box test results for models A1, A2, B1, B2, C1 and C2 respectively. 
+```{r}
+tsdiag(fit_1)
+tsdiag(fit_1.2)
+tsdiag(fit_2)
+tsdiag(fit_2.2)
+tsdiag(fit_3)
+tsdiag(fit_3.2)
+```
+
+## Appendix G
+Results from other models 
+```{r TSVRFull, echo =FALSE}
+TSVRFull <- ("M	Sigma	C	Epsilon	Error	RMSE_Training	P_SV	RMSE_Test	MAE	Time
+F2	0.009	100	0.1	0.4332898	0.01962872 	90	0.01625211	0.014495	1.42
+G2	0.009	100	0.1	0.2892902	0.02131522	89.47	0.01386994	0.01057129	1.27
+H1	0.1	1	0.1	0.3345778	0.02080978	94.44	0.01337283	0.01078913	0.98
+I2	0.2	10	0.1	0.01001574	0.02492408	100	0.01103354	0.009281066	0.96
+J1	0.1	1	0.1	0.3630428	0.02244704	87.5	0.01918214	0.01703321	1.14")
+
+TSVRFull <- read.table(text=TSVRFull, header=TRUE)
+knitr::kable(TSVRFull, format = "latex", booktabs=T, caption = "\\label{tab:TSVRFull}. Results of other models for each embedding dimension")%>%
+  kable_styling(font_size=7, full_width=T, latex_options = "hold_position")
+```
+```{r include=F}
+F2_plot <- ggplot(F2) + theme(axis.title.y=element_blank())
+G2_plot <- ggplot(G2) + theme(axis.title.y=element_blank()) 
+H1_plot <- ggplot(H1) + theme(axis.title.y=element_blank()) 
+I2_plot <- ggplot(I2) + theme(axis.title.y=element_blank()) 
+J1_plot <- ggplot(J1) + theme(axis.title.y=element_blank()) 
+```
+```{r tsvrkfold, fig.height=8, fig.size=9, fig.cap="K fold validation results (F to J)"}
+grid.arrange(F2_plot, G2_plot, H1_plot, I2_plot, J1_plot, nrow = 5, ncol=1)
+
+```
+```{r tsvrresids, fig.cap="Observed vs Predicted"}
+par(mfrow = c(1, 1))
+plot(ts_df[24:30], type = "l", xaxt="n", xlab="January Date", ylab="Time", col = "black")
+axis(1, at=1:7, labels = 24:30)
+lines(F2_yPred, col = "red")
+points(F2_yPred, col="red", pch=21, bg = "red")
+lines(G2_yPred, col = "blue")
+points(G2_yPred, col="blue", pch=21, bg = "blue")
+lines(H1_yPred, col = "green")
+points(H1_yPred, col="green", pch=21, bg = "green")
+lines(I2_yPred, col = "purple")
+points(I2_yPred, col="purple", pch=21, bg = "purple")
+lines(J1_yPred, col = "yellow")
+points(J1_yPred, col="yellow", pch=21, bg = "yellow")
+legend(3,0.24, legend=c("Observed", "Predicted (F1)", "Predicted (G1)", "Predicted (H2)",
+                        "Predicted (I1)", "Predicted (J2)"),
+       col=c("black", "red", "blue", "green", "purple", "yellow"), lty=1)
+title(main = "Observation vs Prediction")
+```
+```{r tsvrresids2, fig.cap="Residuals of all models at 5"}
+par(mfrow = c(3, 2))
+plot(F2_SVRResidual, col = "red", pch=21, bg="red")
+abline(h=0,col="black")
+plot(G2_SVRResidual, col = "blue", pch =21, bg ="blue")
+abline(h=0,col="black")
+plot(H1_SVRResidual, col = "green", pch = 21, bg="green")
+abline(h=0,col="black")
+plot(I2_SVRResidual, col = "purple", pch = 21, bg = "purple")
+abline(h=0,col="black")
+plot(J1_SVRResidual, col = "yellow", pch = 21, bg = "yellow")
+abline(h=0,col="black")
+par(mfrow = c(1, 1))
+```
+```{r tsvracf, fig.cap="Residual autocorrelation after model fit"}
+par(mfrow = c(3, 2))
+acf(F2_SVRResidual)
+acf(G2_SVRResidual)
+acf(H1_SVRResidual)
+acf(I2_SVRResidual)
+acf(J1_SVRResidual)
+par(mfrow = c(1, 1))
+```
+```{r svtsvr, fig.height=5, fig.size=8, echo=FALSE}
+par(mfrow = c(3, 2))
+plot(F_yTrain, col = cols[F2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (F1)")
+plot(G_yTrain, col = cols[G2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (G1)")
+plot(H_yTrain, col = cols[H1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (H2)")
+plot(I_yTrain, col = cols[I2_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (I1)")
+plot(J_yTrain, col = cols[J1_lbls], pch=16, xlab="January Dates", ylab="Time")
+title (main = "SVR Support Vectors in Training Data (J2)")
+plot(NULL ,xaxt='n',yaxt='n',bty='n',ylab='',xlab='', xlim=0:1, ylim=0:1)
+legend("topleft", legend=c("Not Support Vector", "Support Vector"), pch=16, pt.cex=3, cex=1.5, bty='n',
+       col = cols)
+mtext("Class", at=0.2, cex=1)
+par(mfrow = c(1, 1))
+```
+\pagebreak
+
+# References
+
+```{r writegif}
+
+# for (i in 1:180){
+#   speedmap <- get_speed_map(i)
+#   path <- sprintf("/pictures/%s.png", convert_time(i))
+#   mapshot(speedmap, file = paste0(getwd(),path,sep=""))
+# }
+# 
+# file_path <-  paste0(getwd(),'/pictures', sep="")
+# list.files(path = file_path, pattern = "*.png", full.names = T) %>% 
+#   map(image_read) %>% # reads each path file
+#   image_join() %>% # joins image
+#   image_animate(fps=2) %>% # animates, can opt for number of loops
+#   image_write(sprintf("congestion_across_time.gif"))
+
+```
